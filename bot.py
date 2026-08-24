@@ -1,11 +1,12 @@
 """
 =============================================================================
-STORE STOCK SCAN BOT — AI VISION PACKAGING + PHOTO PUSH TO GOOGLE SHEETS
+STORE STOCK SCAN BOT — DUAL HD PHOTOS (FRONT + BARCODE) TO GOOGLE SHEETS
 =============================================================================
-- Fixed Photo URL duplication for Google Sheets =IMAGE() formula
-- Fixed Gemini API with x-goog-api-key header & multi-model fallback
-- Auto Barcode Scanner (zxing-cpp)
-- Real-time Instant Sync to Google Sheets
+- Catches BOTH Front Packaging Photo & Barcode Photo
+- Clickable HD images in Google Sheets (=HYPERLINK(url, IMAGE(url)))
+- Auto Barcode Recognition (zxing-cpp)
+- AI Vision Packaging Name Extraction (Gemini REST)
+- Instant Real-time Sync
 =============================================================================
 """
 
@@ -129,7 +130,8 @@ async def init_db():
                 qty REAL NOT NULL DEFAULT 1,
                 photo_front TEXT,
                 photo_barcode TEXT,
-                photo_url TEXT,
+                photo_front_url TEXT,
+                photo_barcode_url TEXT,
                 synced_sheet INTEGER NOT NULL DEFAULT 0
             );
         """)
@@ -137,7 +139,18 @@ async def init_db():
         await db.commit()
 
 
-async def db_insert_count(user_id: int, crew_name: str, shelf: str, barcode: str, item_name: str, qty: float, photo_front: str = None, photo_barcode: str = None, photo_url: str = None) -> Dict[str, Any]:
+async def db_insert_count(
+    user_id: int,
+    crew_name: str,
+    shelf: str,
+    barcode: str,
+    item_name: str,
+    qty: float,
+    photo_front: str = None,
+    photo_barcode: str = None,
+    photo_front_url: str = None,
+    photo_barcode_url: str = None
+) -> Dict[str, Any]:
     timestamp = get_current_timestamp()
     shelf_clean = (shelf or "UNKNOWN").strip().upper()
     barcode_clean = str(barcode or "NO_BARCODE").strip()
@@ -147,10 +160,14 @@ async def db_insert_count(user_id: int, crew_name: str, shelf: str, barcode: str
         cursor = await db.execute(
             """
             INSERT INTO counts (
-                timestamp, user_id, crew_name, shelf, barcode, item_name, qty, photo_front, photo_barcode, photo_url, synced_sheet
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
+                timestamp, user_id, crew_name, shelf, barcode, item_name, qty,
+                photo_front, photo_barcode, photo_front_url, photo_barcode_url, synced_sheet
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
             """,
-            (timestamp, user_id, crew_name, shelf_clean, barcode_clean, item_name_clean, qty, photo_front, photo_barcode, photo_url)
+            (
+                timestamp, user_id, crew_name, shelf_clean, barcode_clean, item_name_clean, qty,
+                photo_front, photo_barcode, photo_front_url, photo_barcode_url
+            )
         )
         row_id = cursor.lastrowid
         await db.commit()
@@ -166,7 +183,8 @@ async def db_insert_count(user_id: int, crew_name: str, shelf: str, barcode: str
         "qty": qty,
         "photo_front": photo_front,
         "photo_barcode": photo_barcode,
-        "photo_url": photo_url,
+        "photo_front_url": photo_front_url,
+        "photo_barcode_url": photo_barcode_url,
         "synced_sheet": 0
     }
 
@@ -181,7 +199,7 @@ async def db_mark_synced(count_ids: list):
 
 
 # ---------------------------------------------------------------------------
-# 3. AI VISION PRODUCT NAME EXTRACTOR (Gemini Vision with Header Auth)
+# 3. AI VISION PRODUCT NAME EXTRACTOR
 # ---------------------------------------------------------------------------
 def compress_image_for_ai(image_path: str) -> Optional[str]:
     try:
@@ -258,7 +276,6 @@ async def extract_product_name_from_image(image_path: str) -> Optional[str]:
                                 logger.info(f"✨ AI Vision ({model}) extracted name: '{clean_name}'")
                                 return clean_name
                     elif resp.status in (404, 400):
-                        # Try with key in URL as fallback
                         url_with_key = f"{url}?key={api_key}"
                         async with session.post(url_with_key, json=payload, headers={"Content-Type": "application/json"}, timeout=aiohttp.ClientTimeout(total=8)) as resp2:
                             if resp2.status == 200:
@@ -269,9 +286,6 @@ async def extract_product_name_from_image(image_path: str) -> Optional[str]:
                                     clean2 = text2.strip().replace("\n", " ").replace("*", "").replace('"', '').strip()
                                     if clean2:
                                         return clean2
-                    else:
-                        err_text = await resp.text()
-                        logger.warning(f"Gemini API ({model}) returned {resp.status}: {err_text}")
         except Exception as e:
             logger.warning(f"Error calling Gemini API ({model}): {e}")
 
@@ -313,7 +327,7 @@ def detect_barcode_from_image(image_path: str) -> Optional[str]:
 
 
 # ---------------------------------------------------------------------------
-# 5. GOOGLE SHEETS ASYNC BACKGROUND SYNC (With Clean Photo URL)
+# 5. GOOGLE SHEETS ASYNC BACKGROUND SYNC (Dual Photos: Front + Barcode)
 # ---------------------------------------------------------------------------
 class SheetsSyncManager:
     def __init__(self, webhook_url: Optional[str] = None):
@@ -356,7 +370,8 @@ class SheetsSyncManager:
             "barcode": str(data.get("barcode", "")),
             "name": data.get("item_name", ""),
             "qty": data.get("qty", 1),
-            "photo_url": data.get("photo_url", "")
+            "photo_front_url": data.get("photo_front_url", ""),
+            "photo_barcode_url": data.get("photo_barcode_url", "")
         }
         for attempt in range(1, 4):
             try:
@@ -452,7 +467,7 @@ async def save_tg_photo(file_id: str, context: ContextTypes.DEFAULT_TYPE, prefix
         file_path = str(PHOTOS_DIR / filename)
         await tg_file.download_to_drive(custom_path=file_path)
         
-        # Clean photo_url (Avoid duplicate prefix)
+        # Build direct telegram photo link cleanly without double prefixes
         raw_path = tg_file.file_path or ""
         if raw_path.startswith("http"):
             photo_url = raw_path
@@ -475,7 +490,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"2️⃣ Send barcode photo (or tap Skip)\n"
         f"3️⃣ Type Shelf (e.g. `G101`)\n"
         f"4️⃣ Type Quantity (e.g. `12`)\n\n"
-        f"⚡ *Data auto-syncs instantly to Google Sheets!*"
+        f"⚡ *Both Front & Barcode photos sync directly to Google Sheets!*"
     )
     await update.message.reply_text(
         msg,
@@ -485,7 +500,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ---------------------------------------------------------------------------
-# 8. PHOTO FLOW (Photo -> Shelf -> Quantity -> Done!)
+# 8. PHOTO FLOW (Front Photo -> Barcode Photo -> Shelf -> Quantity -> Saved)
 # ---------------------------------------------------------------------------
 async def handle_incoming_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data.clear()
@@ -493,9 +508,9 @@ async def handle_incoming_photo(update: Update, context: ContextTypes.DEFAULT_TY
     crew_name = get_user_display_name(update)
 
     photo = update.message.photo[-1]
-    file_path, photo_url = await save_tg_photo(photo.file_id, context, prefix="front")
+    file_path, photo_front_url = await save_tg_photo(photo.file_id, context, prefix="front")
     context.user_data["photo_front"] = file_path
-    context.user_data["photo_url"] = photo_url
+    context.user_data["photo_front_url"] = photo_front_url
 
     # Concurrently detect barcode and extract product name from packaging via AI
     detected_barcode, detected_name = await asyncio.gather(
@@ -526,7 +541,7 @@ async def handle_incoming_photo(update: Update, context: ContextTypes.DEFAULT_TY
             item_name=name,
             qty=qty,
             photo_front=file_path,
-            photo_url=photo_url
+            photo_front_url=photo_front_url
         )
         sync_manager.enqueue(record)
         qty_display = int(qty) if qty.is_integer() else qty
@@ -549,8 +564,8 @@ async def handle_incoming_photo(update: Update, context: ContextTypes.DEFAULT_TY
 
     kb = InlineKeyboardMarkup([[InlineKeyboardButton("⏩ Skip (Barcode is in this photo)", callback_data="skip_barcode_photo")]])
     await update.message.reply_text(
-        f"📸 *Photo Received!*{name_status}\n\n"
-        f"Send barcode photo (or tap Skip below):",
+        f"📸 *Photo 1 Received (Product Front)!*{name_status}\n\n"
+        f"📷 Now send **Photo 2 (Barcode label)** (or tap Skip below):",
         reply_markup=kb,
         parse_mode="Markdown"
     )
@@ -560,11 +575,14 @@ async def handle_incoming_photo(update: Update, context: ContextTypes.DEFAULT_TY
 async def flow_receive_barcode_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if update.message and update.message.photo:
         photo = update.message.photo[-1]
-        file_path, _ = await save_tg_photo(photo.file_id, context, prefix="barcode")
+        file_path, photo_barcode_url = await save_tg_photo(photo.file_id, context, prefix="barcode")
         context.user_data["photo_barcode"] = file_path
+        context.user_data["photo_barcode_url"] = photo_barcode_url
+        
         detected = detect_barcode_from_image(file_path)
         if detected:
             context.user_data["detected_barcode"] = detected
+            
     return await prompt_shelf_step(update, context)
 
 
@@ -572,6 +590,7 @@ async def flow_skip_barcode_photo_cb(update: Update, context: ContextTypes.DEFAU
     query = update.callback_query
     await query.answer()
     context.user_data["photo_barcode"] = None
+    context.user_data["photo_barcode_url"] = ""
     return await prompt_shelf_step(update, context)
 
 
@@ -657,7 +676,8 @@ async def finalize_and_save_count(update: Update, context: ContextTypes.DEFAULT_
     qty = context.user_data.get("qty", 1.0)
     photo_front = context.user_data.get("photo_front")
     photo_barcode = context.user_data.get("photo_barcode")
-    photo_url = context.user_data.get("photo_url", "")
+    photo_front_url = context.user_data.get("photo_front_url", "")
+    photo_barcode_url = context.user_data.get("photo_barcode_url", "")
 
     record = await db_insert_count(
         user_id=user.id if user else 0,
@@ -668,7 +688,8 @@ async def finalize_and_save_count(update: Update, context: ContextTypes.DEFAULT_
         qty=qty,
         photo_front=photo_front,
         photo_barcode=photo_barcode,
-        photo_url=photo_url
+        photo_front_url=photo_front_url,
+        photo_barcode_url=photo_barcode_url
     )
 
     sync_manager.enqueue(record)
