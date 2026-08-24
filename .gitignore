@@ -1,0 +1,26 @@
+# Python virtual environment
+venv/
+.venv/
+env/
+
+# Environment secrets
+.env
+
+# Database & SQLite files
+*.db
+*.sqlite3
+test_inventory.db
+
+# Media & photos directory (created at runtime)
+photos/*
+!photos/.gitkeep
+
+# Byte-compiled files
+__pycache__/
+*.py[cod]
+*$py.class
+*.log
+
+# OS metadata
+.DS_Store
+Thumbs.db
