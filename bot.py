@@ -1,6 +1,6 @@
 """
 =============================================================================
-STORE STOCK COUNT TELEGRAM BOT — ALL-IN-ONE
+STORE STOCK COUNT TELEGRAM BOT — ALL-IN-ONE (FREE CLOUD WEB SERVICE READY)
 =============================================================================
 Features:
 - Multi-user concurrency for many store crew members counting simultaneously
@@ -10,6 +10,7 @@ Features:
 - Fast Quantity selection buttons (1, 2, 5, 10, 12, 24, Custom)
 - Real-time Google Sheets auto-fill via Webhook (async background queue)
 - Beautiful 3-tab Excel (.xlsx) export (/export)
+- Built-in lightweight health check web server on $PORT for Render/Railway $0 Free Tier
 =============================================================================
 """
 
@@ -29,6 +30,7 @@ from PIL import Image, ImageEnhance, ImageOps
 import zxingcpp
 import aiosqlite
 import aiohttp
+from aiohttp import web
 import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
@@ -60,6 +62,7 @@ DATABASE_PATH = os.getenv("DATABASE_PATH", str(BASE_DIR / "inventory.db"))
 PHOTOS_DIR = Path(os.getenv("PHOTOS_DIR", str(BASE_DIR / "photos")))
 PHOTOS_DIR.mkdir(parents=True, exist_ok=True)
 TIMEZONE = os.getenv("TIMEZONE", "Asia/Bangkok")
+PORT = int(os.getenv("PORT", "8080"))
 
 ADMIN_IDS_RAW = os.getenv("ADMIN_USER_IDS", "").strip()
 ADMIN_USER_IDS = set()
@@ -569,7 +572,25 @@ def create_excel_report(counts: List[Dict[str, Any]]) -> BytesIO:
 
 
 # ---------------------------------------------------------------------------
-# 6. TELEGRAM BOT HANDLERS & STATE MACHINE
+# 6. LIGHTWEIGHT HTTP HEALTH SERVER (Allows Render $0 Free Web Service)
+# ---------------------------------------------------------------------------
+async def handle_health(request):
+    return web.Response(text="✅ Store Stock Count Telegram Bot is active and running!", content_type="text/plain")
+
+
+async def start_health_web_server():
+    app = web.Application()
+    app.router.add_get("/", handle_health)
+    app.router.add_get("/health", handle_health)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", PORT)
+    await site.start()
+    logger.info(f"Health check web server running on port {PORT}")
+
+
+# ---------------------------------------------------------------------------
+# 7. TELEGRAM BOT HANDLERS & STATE MACHINE
 # ---------------------------------------------------------------------------
 def get_user_display_name(update: Update) -> str:
     user = update.effective_user
@@ -1050,7 +1071,9 @@ def build_application() -> Application:
 async def post_init(application: Application):
     await init_db()
     await sync_manager.start()
-    logger.info("Bot & Database Initialized.")
+    # Start web health server for Render Free Web Service
+    await start_health_web_server()
+    logger.info("Bot & Web Server Initialized.")
 
 
 async def post_shutdown(application: Application):
