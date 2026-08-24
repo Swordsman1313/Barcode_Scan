@@ -3,10 +3,11 @@
 STORE STOCK SCAN BOT — SMART DUAL-PHOTO & ANY-ORDER AUTO NAMER
 =============================================================================
 - Works with photos in ANY order (Front first OR Barcode first)
-- Auto-extracts Product Name from BOTH Photo 1 and Photo 2 via AI Vision
-- Auto-extracts Barcode from BOTH Photo 1 and Photo 2 via zxing-cpp
-- Smart Photo Sorting: Automatically puts Front in Column G and Barcode in Column H
-- Clickable HD images in Google Sheets
+- Robust Gemini AI Vision with quote sanitization & 15s timeout
+- /testai diagnostic command to instantly verify Gemini API connection
+- Auto-extracts Barcode via zxing-cpp
+- Smart Photo Sorting: Front in Column G and Barcode in Column H
+- Clickable Full HD images in Google Sheets
 =============================================================================
 """
 
@@ -53,28 +54,33 @@ from telegram.ext import (
 )
 
 # ---------------------------------------------------------------------------
-# 1. CONFIGURATION
+# 1. CONFIGURATION (Robust Environment Sanitization)
 # ---------------------------------------------------------------------------
 BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / ".env")
 
-TELEGRAM_BOT_TOKEN = (
-    os.getenv("TELEGRAM_BOT_TOKEN", "")
-    or os.getenv("TELEGRAN_BOT_TOKEN", "")
-    or os.getenv("BOT_TOKEN", "")
-).strip()
+def clean_env(val: Optional[str]) -> str:
+    if not val:
+        return ""
+    return val.strip().strip('"').strip("'").strip()
 
-GOOGLE_SHEET_WEBHOOK_URL = (
-    os.getenv("GOOGLE_SHEET_WEBHOOK_URL", "")
-    or os.getenv("GOOGLE_SHEETS_WEBHOOK_URL", "")
-    or os.getenv("SHEET_WEBHOOK_URL", "")
-).strip()
+TELEGRAM_BOT_TOKEN = clean_env(
+    os.getenv("TELEGRAM_BOT_TOKEN")
+    or os.getenv("TELEGRAN_BOT_TOKEN")
+    or os.getenv("BOT_TOKEN")
+)
 
-GEMINI_API_KEY = (
-    os.getenv("GEMINI_API_KEY", "")
-    or os.getenv("GOOGLE_API_KEY", "")
-    or os.getenv("GEMINI_KEY", "")
-).strip()
+GOOGLE_SHEET_WEBHOOK_URL = clean_env(
+    os.getenv("GOOGLE_SHEET_WEBHOOK_URL")
+    or os.getenv("GOOGLE_SHEETS_WEBHOOK_URL")
+    or os.getenv("SHEET_WEBHOOK_URL")
+)
+
+GEMINI_API_KEY = clean_env(
+    os.getenv("GEMINI_API_KEY")
+    or os.getenv("GOOGLE_API_KEY")
+    or os.getenv("GEMINI_KEY")
+)
 
 DATABASE_PATH = os.getenv("DATABASE_PATH", str(BASE_DIR / "inventory.db"))
 PHOTOS_DIR = Path(os.getenv("PHOTOS_DIR", str(BASE_DIR / "photos")))
@@ -220,7 +226,7 @@ async def extract_product_name_from_image(image_path: str) -> Optional[str]:
     if not image_path or not os.path.exists(image_path):
         return None
 
-    api_key = GEMINI_API_KEY
+    api_key = clean_env(os.getenv("GEMINI_API_KEY") or GEMINI_API_KEY)
     if not api_key:
         logger.warning("⚠️ GEMINI_API_KEY is not set.")
         return None
@@ -258,12 +264,16 @@ async def extract_product_name_from_image(image_path: str) -> Optional[str]:
                         }
                     }
                 ]
-            }]
+            }],
+            "generationConfig": {
+                "temperature": 0.2,
+                "maxOutputTokens": 30
+            }
         }
 
         try:
             async with aiohttp.ClientSession() as session:
-                async with session.post(url, json=payload, headers=headers, timeout=aiohttp.ClientTimeout(total=8)) as resp:
+                async with session.post(url, json=payload, headers=headers, timeout=aiohttp.ClientTimeout(total=12)) as resp:
                     if resp.status == 200:
                         data = await resp.json()
                         candidates = data.get("candidates", [])
@@ -273,10 +283,41 @@ async def extract_product_name_from_image(image_path: str) -> Optional[str]:
                             if clean_name and len(clean_name) > 2 and "unknown" not in clean_name.lower():
                                 logger.info(f"✨ AI Vision ({model}) detected: '{clean_name}'")
                                 return clean_name
+                    else:
+                        err_text = await resp.text()
+                        logger.warning(f"Gemini API ({model}) returned status {resp.status}: {err_text}")
         except Exception as e:
             logger.debug(f"Gemini API ({model}) check error: {e}")
 
     return None
+
+
+async def test_gemini_api_connection() -> str:
+    """Diagnostic tool to test Gemini API key health."""
+    api_key = clean_env(os.getenv("GEMINI_API_KEY") or GEMINI_API_KEY)
+    if not api_key:
+        return "❌ `GEMINI_API_KEY` is NOT set in Render Environment Variables!"
+
+    key_preview = f"{api_key[:6]}...{api_key[-4:]}" if len(api_key) > 10 else "SHORT_KEY"
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={api_key}"
+    payload = {
+        "contents": [{
+            "parts": [{"text": "Hello! Reply with the single word: OK"}]
+        }]
+    }
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, json=payload, headers={"Content-Type": "application/json"}, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                body = await resp.text()
+                if resp.status == 200:
+                    data = await resp.json()
+                    res_text = data.get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "").strip()
+                    return f"✅ **Gemini AI API is Working 100%!**\n• Key: `{key_preview}`\n• Response: `{res_text}`\n• Status: `200 OK`"
+                else:
+                    return f"⚠️ **Gemini API Error (Status {resp.status}):**\n`{body[:300]}`"
+    except Exception as e:
+        return f"❌ **Connection Error:** `{e}`"
 
 
 # ---------------------------------------------------------------------------
@@ -458,7 +499,8 @@ async def save_tg_photo(file_id: str, context: ContextTypes.DEFAULT_TYPE, prefix
         if raw_path.startswith("http"):
             photo_url = raw_path
         elif raw_path:
-            photo_url = f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}/{raw_path.lstrip('/')}"
+            token = clean_env(os.getenv("TELEGRAM_BOT_TOKEN") or TELEGRAM_BOT_TOKEN)
+            photo_url = f"https://api.telegram.org/file/bot{token}/{raw_path.lstrip('/')}"
         else:
             photo_url = ""
             
@@ -483,6 +525,12 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=ReplyKeyboardRemove(),
         parse_mode="Markdown"
     )
+
+
+async def cmd_testai(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = await update.message.reply_text("⏳ *Testing Gemini AI Vision API connection...*", parse_mode="Markdown")
+    report = await test_gemini_api_connection()
+    await msg.edit_text(report, parse_mode="Markdown")
 
 
 # ---------------------------------------------------------------------------
@@ -802,6 +850,7 @@ async def main_async():
     tg_app.add_handler(conv)
     tg_app.add_handler(CommandHandler("start", cmd_start))
     tg_app.add_handler(CommandHandler("help", cmd_start))
+    tg_app.add_handler(CommandHandler("testai", cmd_testai))
 
     await tg_app.initialize()
     await tg_app.start()
