@@ -1,7 +1,7 @@
-python-telegram-bot[job-queue]>=21.0
+python-telegram-bot>=21.0
 openpyxl>=3.1.2
 aiohttp>=3.9.3
 aiosqlite>=0.20.0
 pillow>=10.2.0
 python-dotenv>=1.0.1
-zxing-cpp>=3.0.0
+zxing-cpp>=2.2.0

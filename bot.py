@@ -1,14 +1,11 @@
 """
 =============================================================================
-STORE STOCK COUNT TELEGRAM BOT — ULTRA-SIMPLE CREW & GROUP EDITION
+STORE STOCK COUNT TELEGRAM BOT — RENDER RESILIENT EDITION
 =============================================================================
-Features:
-- ZERO COMMANDS NEEDED: Big touch buttons at bottom of screen
-- FULL TELEGRAM GROUP CHAT SUPPORT: Add bot to store crew group
-- 1-SHOT QUICK CAPTION MODE: Send photo with caption "G101 8850123456789 Coke 12" -> Auto-saved in 1 second!
-- STEP-BY-STEP GUIDED MODE: Big interactive buttons for shelf & quantity
-- REAL-TIME GOOGLE SHEETS & EXCEL EXPORT: Auto-syncs live + 1-tap Excel download
-- BUILT-IN WEB SERVER: Runs 24/7 on Render $0 Free Tier
+- Web health check server runs immediately on $PORT for Render $0 Free Web Service
+- Safe environment token checking (no crash on missing token)
+- Safe barcode decoding with zxing-cpp fallback
+- Big touch buttons & group chat support
 =============================================================================
 """
 
@@ -26,7 +23,14 @@ from typing import Optional, List, Dict, Any, Tuple
 
 from dotenv import load_dotenv
 from PIL import Image, ImageEnhance, ImageOps
-import zxingcpp
+
+# Safe import for zxingcpp
+try:
+    import zxingcpp
+    HAS_ZXING = True
+except ImportError:
+    HAS_ZXING = False
+
 import aiosqlite
 import aiohttp
 from aiohttp import web
@@ -298,21 +302,11 @@ async def db_get_summary_stats() -> Dict[str, Any]:
     }
 
 
-async def db_delete_count(count_id: int, user_id: Optional[int] = None) -> bool:
-    async with get_db() as db:
-        if user_id:
-            cursor = await db.execute("DELETE FROM counts WHERE id = ? AND user_id = ?", (count_id, user_id))
-        else:
-            cursor = await db.execute("DELETE FROM counts WHERE id = ?", (count_id,))
-        await db.commit()
-        return cursor.rowcount > 0
-
-
 # ---------------------------------------------------------------------------
 # 4. BARCODE RECOGNITION (zxing-cpp + PIL)
 # ---------------------------------------------------------------------------
 def detect_barcode_from_image(image_path: str) -> Optional[str]:
-    if not image_path or not os.path.exists(image_path):
+    if not HAS_ZXING or not image_path or not os.path.exists(image_path):
         return None
     try:
         with Image.open(image_path) as img:
@@ -604,37 +598,11 @@ def create_excel_report(counts: List[Dict[str, Any]]) -> BytesIO:
 
 
 # ---------------------------------------------------------------------------
-# 7. LIGHTWEIGHT HTTP HEALTH SERVER (Allows Render $0 Free Web Service)
-# ---------------------------------------------------------------------------
-async def handle_health(request):
-    return web.Response(text="✅ Store Stock Count Telegram Bot is active and running!", content_type="text/plain")
-
-
-async def start_health_web_server():
-    app = web.Application()
-    app.router.add_get("/", handle_health)
-    app.router.add_get("/health", handle_health)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", PORT)
-    await site.start()
-    logger.info(f"Health check web server running on port {PORT}")
-
-
-# ---------------------------------------------------------------------------
-# 8. PARSE 1-SHOT CAPTION (Fastest way for crew)
+# 7. PARSE 1-SHOT CAPTION (Fastest way for crew)
 # ---------------------------------------------------------------------------
 def parse_quick_caption(caption: str, default_shelf: Optional[str] = None, detected_barcode: Optional[str] = None) -> Optional[Tuple[str, str, str, float]]:
-    """
-    Parses natural captions like:
-    1. "G101 8850123456789 Coke 12" -> Shelf: G101, Barcode: 8850123456789, Name: Coke, Qty: 12
-    2. "G101 8850123456789 24" -> Shelf: G101, Barcode: 8850123456789, Name: "-", Qty: 24
-    3. "G101 12" (if barcode auto-detected) -> Shelf: G101, Barcode: detected, Name: "-", Qty: 12
-    4. "12" (if active shelf and barcode detected) -> Shelf: default, Barcode: detected, Name: "-", Qty: 12
-    """
     if not caption or not caption.strip():
         return None
-
     tokens = caption.strip().split()
     if not tokens:
         return None
@@ -644,12 +612,10 @@ def parse_quick_caption(caption: str, default_shelf: Optional[str] = None, detec
     item_name = "-"
     qty = 1.0
 
-    # Case: only a number e.g. "12"
     if len(tokens) == 1 and tokens[0].replace(".", "", 1).isdigit():
         qty = float(tokens[0])
         return shelf, barcode, item_name, qty
 
-    # Check last token as QTY
     last_token = tokens[-1]
     if last_token.replace(".", "", 1).isdigit():
         qty = float(last_token)
@@ -658,7 +624,6 @@ def parse_quick_caption(caption: str, default_shelf: Optional[str] = None, detec
     if not tokens:
         return shelf, barcode, item_name, qty
 
-    # Check first token as Shelf (e.g. G101, A02, B12, Shelf1)
     if re.match(r"^[A-Za-z0-9\-_]{2,6}$", tokens[0]) and not tokens[0].isdigit():
         shelf = tokens[0].upper()
         tokens = tokens[1:]
@@ -666,12 +631,10 @@ def parse_quick_caption(caption: str, default_shelf: Optional[str] = None, detec
     if not tokens:
         return shelf, barcode, item_name, qty
 
-    # Check next token as Barcode (e.g. 8850123456789)
     if tokens[0].isdigit() and len(tokens[0]) >= 6:
         barcode = tokens[0]
         tokens = tokens[1:]
 
-    # Any remaining tokens become Item Name
     if tokens:
         item_name = " ".join(tokens)
 
@@ -679,7 +642,7 @@ def parse_quick_caption(caption: str, default_shelf: Optional[str] = None, detec
 
 
 # ---------------------------------------------------------------------------
-# 9. TELEGRAM HANDLERS (Simple Buttons & Group Support)
+# 8. TELEGRAM HANDLERS
 # ---------------------------------------------------------------------------
 def get_user_display_name(update: Update) -> str:
     user = update.effective_user
@@ -704,7 +667,6 @@ async def save_tg_photo(file_id: str, context: ContextTypes.DEFAULT_TYPE, prefix
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Simple friendly greeting with big touch buttons."""
     user = update.effective_user
     active_shelf = await db_get_user_active_shelf(user.id) if user else None
     shelf_display = f"`{active_shelf}`" if active_shelf else "_Not set_"
@@ -727,7 +689,6 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_text_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handles clicks on the large reply keyboard buttons."""
     text = update.message.text.strip() if update.message and update.message.text else ""
 
     if text == "📸 Count New Item":
@@ -752,7 +713,6 @@ async def handle_text_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
 async def cmd_export(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Generates and sends Excel report."""
     msg = await update.message.reply_text("⏳ *Generating Excel file...*", parse_mode="Markdown")
     try:
         counts = await db_get_all_counts()
@@ -798,10 +758,9 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ---------------------------------------------------------------------------
-# 10. PHOTO HANDLER (1-Shot Caption OR Step-by-Step Flow)
+# 9. PHOTO FLOW
 # ---------------------------------------------------------------------------
 async def handle_incoming_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Entry point when crew sends a photo."""
     context.user_data.clear()
     user = update.effective_user
     crew_name = get_user_display_name(update)
@@ -810,20 +769,16 @@ async def handle_incoming_photo(update: Update, context: ContextTypes.DEFAULT_TY
     file_path = await save_tg_photo(photo.file_id, context, prefix="front")
     context.user_data["photo_front"] = file_path
 
-    # Try auto-detecting barcode from photo
     detected = detect_barcode_from_image(file_path)
     if detected:
         context.user_data["detected_barcode"] = detected
 
     active_shelf = await db_get_user_active_shelf(user.id) if user else None
-
-    # Check if crew wrote a 1-shot caption (e.g. "G101 8850123456789 Coke 12" or "G101 24")
     caption = update.message.caption or ""
     quick_data = parse_quick_caption(caption, default_shelf=active_shelf, detected_barcode=detected)
 
     if quick_data:
         shelf, barcode, name, qty = quick_data
-        # Fast save in 1 second!
         record = await db_insert_count(
             user_id=user.id if user else 0,
             crew_name=crew_name,
@@ -840,7 +795,7 @@ async def handle_incoming_photo(update: Update, context: ContextTypes.DEFAULT_TY
         qty_display = int(qty) if qty.is_integer() else qty
 
         await update.message.reply_text(
-            f"⚡ *SAVED IN 1 SECOND! (ID #{record['id']})*\n"
+            f"⚡ *SAVED! (ID #{record['id']})*\n"
             f"━━━━━━━━━━━━━━━━━━━━━━\n"
             f"📍 *Shelf:* `{shelf}`\n"
             f"🏷️ *Barcode:* `{barcode}`\n"
@@ -854,11 +809,9 @@ async def handle_incoming_photo(update: Update, context: ContextTypes.DEFAULT_TY
         )
         return ConversationHandler.END
 
-    # Guided Step-by-Step mode
     kb = InlineKeyboardMarkup([[InlineKeyboardButton("⏩ Skip (Barcode is in this photo)", callback_data="skip_barcode_photo")]])
     await update.message.reply_text(
-        "📸 *Photo Received!*\n\n"
-        "Send a close-up photo of the **Barcode label** (or tap Skip below):",
+        "📸 *Photo Received!*\n\nSend barcode photo (or tap Skip below):",
         reply_markup=kb,
         parse_mode="Markdown"
     )
@@ -893,9 +846,9 @@ async def prompt_shelf_step(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             [InlineKeyboardButton(f"✅ Keep Shelf {active_shelf}", callback_data=f"keep_shelf_{active_shelf}")],
             [InlineKeyboardButton("✏️ Enter Different Shelf", callback_data="change_shelf")]
         ])
-        await target.reply_text(f"📍 *Shelf Location*\n\nCurrent shelf: `{active_shelf}`\nTap below or type new shelf (e.g. `G102`):", reply_markup=kb, parse_mode="Markdown")
+        await target.reply_text(f"📍 *Shelf:* `{active_shelf}`\nTap to keep or type a new one:", reply_markup=kb, parse_mode="Markdown")
     else:
-        await target.reply_text("📍 *Shelf Location*\n\nPlease type the **Shelf Code** (e.g. `G101`):", parse_mode="Markdown")
+        await target.reply_text("📍 Please type the **Shelf Code** (e.g. `G101`):", parse_mode="Markdown")
     return STATE_SHELF
 
 
@@ -931,9 +884,9 @@ async def prompt_barcode_step(update: Update, context: ContextTypes.DEFAULT_TYPE
             [InlineKeyboardButton(f"✅ Confirm Barcode: {detected}", callback_data=f"confirm_barcode_{detected}")],
             [InlineKeyboardButton("✏️ Type Different Barcode", callback_data="type_barcode")]
         ])
-        await target.reply_text(f"🏷️ *Barcode Number*\n\n🔍 *Detected:* `{detected}`\nTap to confirm or type manually:", reply_markup=kb, parse_mode="Markdown")
+        await target.reply_text(f"🏷️ *Barcode:* `{detected}`\nTap to confirm or type manually:", reply_markup=kb, parse_mode="Markdown")
     else:
-        await target.reply_text("🏷️ *Barcode Number*\n\nPlease type the **Barcode numbers** from the label:", parse_mode="Markdown")
+        await target.reply_text("🏷️ Please type the **Barcode number** from the label:", parse_mode="Markdown")
     return STATE_BARCODE
 
 
@@ -961,7 +914,7 @@ async def flow_barcode_text(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 async def prompt_item_name_step(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     target = update.callback_query.message if update.callback_query else update.message
     kb = InlineKeyboardMarkup([[InlineKeyboardButton("⏩ Skip / No Name", callback_data="skip_item_name")]])
-    await target.reply_text("📦 *Product Name / Description*\n\nType the **Product Name** (or tap Skip):", reply_markup=kb, parse_mode="Markdown")
+    await target.reply_text("📦 Type the **Product Name** (or tap Skip):", reply_markup=kb, parse_mode="Markdown")
     return STATE_ITEM_NAME
 
 
@@ -1061,12 +1014,50 @@ async def flow_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
 
 
 # ---------------------------------------------------------------------------
-# 11. APPLICATION BUILDER
+# 10. LIGHTWEIGHT HTTP HEALTH SERVER
 # ---------------------------------------------------------------------------
-def build_application() -> Application:
+async def handle_health_check(request):
     if not TELEGRAM_BOT_TOKEN:
-        raise ValueError("TELEGRAM_BOT_TOKEN is empty! Please set it in your .env file.")
-    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+        return web.Response(
+            text="⚠️ Bot server is online, but TELEGRAM_BOT_TOKEN is missing in Render Environment Variables!",
+            content_type="text/plain",
+            status=200
+        )
+    return web.Response(
+        text="✅ Store Stock Count Telegram Bot is active and running 24/7!",
+        content_type="text/plain",
+        status=200
+    )
+
+
+# ---------------------------------------------------------------------------
+# 11. MAIN RUNNER (Starts Web Server & Telegram Polling Concurrently)
+# ---------------------------------------------------------------------------
+async def main_async():
+    logger.info("Initializing SQLite database...")
+    await init_db()
+    await sync_manager.start()
+
+    # 1. Start Web Health Server on PORT immediately for Render
+    app_web = web.Application()
+    app_web.router.add_get("/", handle_health_check)
+    app_web.router.add_get("/health", handle_health_check)
+    runner = web.AppRunner(app_web)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", PORT)
+    await site.start()
+    logger.info(f"🚀 Web health server listening on port {PORT}")
+
+    # 2. Check Bot Token
+    if not TELEGRAM_BOT_TOKEN:
+        logger.error("❌ ERROR: TELEGRAM_BOT_TOKEN is not set in Environment Variables! Please add it in Render Dashboard.")
+        # Keep web server alive so Render health check succeeds
+        while True:
+            await asyncio.sleep(3600)
+
+    # 3. Start Telegram Bot
+    logger.info("🤖 Starting Telegram Bot polling...")
+    tg_app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
     conv = ConversationHandler(
         entry_points=[
@@ -1105,37 +1096,32 @@ def build_application() -> Application:
         per_chat=True
     )
 
-    app.add_handler(conv)
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("help", cmd_start))
-    app.add_handler(CommandHandler("export", cmd_export))
-    app.add_handler(CommandHandler("stats", cmd_stats))
+    tg_app.add_handler(conv)
+    tg_app.add_handler(CommandHandler("start", cmd_start))
+    tg_app.add_handler(CommandHandler("help", cmd_start))
+    tg_app.add_handler(CommandHandler("export", cmd_export))
+    tg_app.add_handler(CommandHandler("stats", cmd_stats))
+    tg_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_buttons))
 
-    # Catch-all for text button clicks (e.g. "📸 Count New Item", "📊 Export Excel")
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_buttons))
+    await tg_app.initialize()
+    await tg_app.start()
+    await tg_app.updater.start_polling(drop_pending_updates=True)
+    logger.info("🎉 Bot is online and listening for messages!")
 
-    return app
-
-
-async def post_init(application: Application):
-    await init_db()
-    await sync_manager.start()
-    await start_health_web_server()
-    logger.info("Bot & Web Server Initialized.")
-
-
-async def post_shutdown(application: Application):
-    await sync_manager.stop()
-    logger.info("Bot Shutdown.")
+    # Keep running forever
+    try:
+        while True:
+            await asyncio.sleep(3600)
+    finally:
+        await tg_app.updater.stop()
+        await tg_app.stop()
+        await tg_app.shutdown()
+        await sync_manager.stop()
+        await runner.cleanup()
 
 
 def main():
-    print("🚀 Initializing Store Stock Count Telegram Bot...")
-    app = build_application()
-    app.post_init = post_init
-    app.post_shutdown = post_shutdown
-    print("🤖 Bot is running! Press Ctrl+C to stop.")
-    app.run_polling(drop_pending_updates=True)
+    asyncio.run(main_async())
 
 
 if __name__ == "__main__":
