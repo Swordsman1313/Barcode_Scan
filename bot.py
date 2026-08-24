@@ -2,9 +2,8 @@
 =============================================================================
 STORE STOCK SCAN BOT — SMART DUAL-PHOTO & ANY-ORDER AUTO NAMER
 =============================================================================
+- Primary AI Vision Engine: Gemini 3.5 Flash & Gemini 3.7 Flash
 - Works with photos in ANY order (Front first OR Barcode first)
-- Uses v1 & v1beta multi-version Gemini endpoints (gemini-1.5-flash, 2.0-flash, latest)
-- Dynamic Model Discovery & Auto-Fallback
 - Auto-extracts Barcode via zxing-cpp
 - Smart Photo Sorting: Front in Column G and Barcode in Column H
 - Clickable Full HD images in Google Sheets
@@ -222,19 +221,16 @@ def compress_image_for_ai(image_path: str) -> Optional[str]:
         return None
 
 
-async def get_available_gemini_endpoints(api_key: str) -> List[str]:
-    """Tries listing models or returns comprehensive fallback list of endpoints."""
-    endpoints = []
-    
-    # Priority list of endpoints covering v1, v1beta, and all flash versions
-    endpoints.append(f"https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent?key={api_key}")
-    endpoints.append(f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-latest:generateContent?key={api_key}")
-    endpoints.append(f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={api_key}")
-    endpoints.append(f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-exp:generateContent?key={api_key}")
-    endpoints.append(f"https://generativelanguage.googleapis.com/v1/models/gemini-1.5-pro:generateContent?key={api_key}")
-    endpoints.append(f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={api_key}")
-
-    return endpoints
+def get_gemini_models_list() -> List[str]:
+    return [
+        "models/gemini-3.5-flash",
+        "models/gemini-3.5-flash-lite",
+        "models/gemini-3.7-flash",
+        "models/gemini-flash-latest",
+        "models/gemini-2.5-flash",
+        "models/gemini-2.5-pro",
+        "models/gemini-1.5-flash"
+    ]
 
 
 async def extract_product_name_from_image(image_path: str) -> Optional[str]:
@@ -275,12 +271,13 @@ async def extract_product_name_from_image(image_path: str) -> Optional[str]:
         }
     }
 
-    endpoints = await get_available_gemini_endpoints(api_key)
+    models = get_gemini_models_list()
     
-    for url in endpoints:
+    for model_name in models:
+        url = f"https://generativelanguage.googleapis.com/v1beta/{model_name}:generateContent?key={api_key}"
         try:
             async with aiohttp.ClientSession() as session:
-                async with session.post(url, json=payload, headers={"Content-Type": "application/json"}, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                async with session.post(url, json=payload, headers={"Content-Type": "application/json"}, timeout=aiohttp.ClientTimeout(total=12)) as resp:
                     if resp.status == 200:
                         data = await resp.json()
                         candidates = data.get("candidates", [])
@@ -288,51 +285,47 @@ async def extract_product_name_from_image(image_path: str) -> Optional[str]:
                             text = candidates[0].get("content", {}).get("parts", [{}])[0].get("text", "")
                             clean_name = text.strip().replace("\n", " ").replace("*", "").replace('"', '').strip()
                             if clean_name and len(clean_name) > 2 and "unknown" not in clean_name.lower():
-                                logger.info(f"✨ AI Vision extracted: '{clean_name}' (via {url.split('models/')[1].split(':')[0]})")
+                                logger.info(f"✨ AI Vision ({model_name}) extracted name: '{clean_name}'")
                                 return clean_name
-                    elif resp.status == 404:
+                    elif resp.status in (404, 429):
                         continue
-                    else:
-                        err_text = await resp.text()
-                        logger.warning(f"Gemini API returned status {resp.status}: {err_text}")
         except Exception as e:
-            logger.debug(f"Gemini API endpoint check error: {e}")
+            logger.debug(f"Gemini API ({model_name}) error: {e}")
 
     return None
 
 
 async def test_gemini_api_connection() -> str:
-    """Diagnostic tool to test Gemini API key health and discover active models."""
+    """Diagnostic tool to test Gemini API key health."""
     api_key = clean_env(os.getenv("GEMINI_API_KEY") or GEMINI_API_KEY)
     if not api_key:
         return "❌ `GEMINI_API_KEY` is NOT set in Render Environment Variables!"
 
     key_preview = f"{api_key[:6]}...{api_key[-4:]}" if len(api_key) > 10 else "SHORT_KEY"
-    endpoints = await get_available_gemini_endpoints(api_key)
+    models = get_gemini_models_list()
 
     payload = {
         "contents": [{
-            "parts": [{"text": "Hello! Reply with the single word: OK"}]
+            "parts": [{"text": "Hello! Reply with only: OK"}]
         }]
     }
 
-    for url in endpoints:
-        model_name = url.split("models/")[1].split(":")[0]
+    for model_name in models:
+        url = f"https://generativelanguage.googleapis.com/v1beta/{model_name}:generateContent?key={api_key}"
         try:
             async with aiohttp.ClientSession() as session:
-                async with session.post(url, json=payload, headers={"Content-Type": "application/json"}, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                    body = await resp.text()
+                async with session.post(url, json=payload, headers={"Content-Type": "application/json"}, timeout=aiohttp.ClientTimeout(total=8)) as resp:
                     if resp.status == 200:
                         data = await resp.json()
                         res_text = data.get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "").strip()
                         return (
                             f"✅ **Gemini AI API is Working 100%!**\n"
                             f"• Key: `{key_preview}`\n"
-                            f"• Active Model: `{model_name}`\n"
+                            f"• Active Model: `{model_name.replace('models/', '')}`\n"
                             f"• Test Response: `{res_text}`\n"
                             f"• Status: `200 OK` 🎉"
                         )
-        except Exception as e:
+        except Exception:
             continue
 
     return f"⚠️ **Could not connect to Gemini API with key `{key_preview}`.**"
