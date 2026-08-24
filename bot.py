@@ -2,10 +2,10 @@
 =============================================================================
 STORE STOCK SCAN BOT — AI VISION PACKAGING + PHOTO PUSH TO GOOGLE SHEETS
 =============================================================================
-- AI Vision Product Name (Gemini REST API with camelCase inlineData & mimeType)
-- Direct Product Photo Push into Google Sheets (=IMAGE)
+- Fixed Photo URL duplication for Google Sheets =IMAGE() formula
+- Fixed Gemini API with x-goog-api-key header & multi-model fallback
 - Auto Barcode Scanner (zxing-cpp)
-- Instant 3-Step Flow: Photo -> Shelf -> QTY -> Synced
+- Real-time Instant Sync to Google Sheets
 =============================================================================
 """
 
@@ -181,7 +181,7 @@ async def db_mark_synced(count_ids: list):
 
 
 # ---------------------------------------------------------------------------
-# 3. AI VISION PRODUCT NAME EXTRACTOR (Fixed CamelCase REST Spec)
+# 3. AI VISION PRODUCT NAME EXTRACTOR (Gemini Vision with Header Auth)
 # ---------------------------------------------------------------------------
 def compress_image_for_ai(image_path: str) -> Optional[str]:
     try:
@@ -213,13 +213,24 @@ async def extract_product_name_from_image(image_path: str) -> Optional[str]:
 
     prompt = (
         "Identify and extract ONLY the Brand Name and Product Name (with flavor or size if visible). "
-        "Return concise name in maximum 5 words. Do NOT include markdown, punctuation, or filler. "
-        "Example: 'Jardo Seaweed Rice Chip' or 'Lay's Classic 50g'."
+        "Return concise name in maximum 5 words. Do NOT include markdown, quotes, bullet points, or filler words. "
+        "Example output: 'Jardo Seaweed Rice Chip' or 'Lay's Classic 50g' or 'Coca Cola 325ml'."
     )
 
-    models = ["gemini-1.5-flash", "gemini-2.0-flash", "gemini-2.5-flash", "gemini-1.5-pro"]
+    models = [
+        "gemini-1.5-flash",
+        "gemini-2.0-flash",
+        "gemini-2.5-flash",
+        "gemini-1.5-flash-8b",
+        "gemini-1.5-pro"
+    ]
+    
     for model in models:
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+        headers = {
+            "Content-Type": "application/json",
+            "x-goog-api-key": api_key
+        }
         payload = {
             "contents": [{
                 "parts": [
@@ -236,7 +247,7 @@ async def extract_product_name_from_image(image_path: str) -> Optional[str]:
 
         try:
             async with aiohttp.ClientSession() as session:
-                async with session.post(url, json=payload, headers={"Content-Type": "application/json"}, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                async with session.post(url, json=payload, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as resp:
                     if resp.status == 200:
                         data = await resp.json()
                         candidates = data.get("candidates", [])
@@ -244,13 +255,23 @@ async def extract_product_name_from_image(image_path: str) -> Optional[str]:
                             text = candidates[0].get("content", {}).get("parts", [{}])[0].get("text", "")
                             clean_name = text.strip().replace("\n", " ").replace("*", "").replace('"', '').strip()
                             if clean_name and len(clean_name) > 2:
-                                logger.info(f"✨ AI Vision extracted product name: '{clean_name}'")
+                                logger.info(f"✨ AI Vision ({model}) extracted name: '{clean_name}'")
                                 return clean_name
-                    elif resp.status == 404:
-                        continue
+                    elif resp.status in (404, 400):
+                        # Try with key in URL as fallback
+                        url_with_key = f"{url}?key={api_key}"
+                        async with session.post(url_with_key, json=payload, headers={"Content-Type": "application/json"}, timeout=aiohttp.ClientTimeout(total=8)) as resp2:
+                            if resp2.status == 200:
+                                data2 = await resp2.json()
+                                candidates2 = data2.get("candidates", [])
+                                if candidates2:
+                                    text2 = candidates2[0].get("content", {}).get("parts", [{}])[0].get("text", "")
+                                    clean2 = text2.strip().replace("\n", " ").replace("*", "").replace('"', '').strip()
+                                    if clean2:
+                                        return clean2
                     else:
                         err_text = await resp.text()
-                        logger.warning(f"Gemini API ({model}) status {resp.status}: {err_text}")
+                        logger.warning(f"Gemini API ({model}) returned {resp.status}: {err_text}")
         except Exception as e:
             logger.warning(f"Error calling Gemini API ({model}): {e}")
 
@@ -292,7 +313,7 @@ def detect_barcode_from_image(image_path: str) -> Optional[str]:
 
 
 # ---------------------------------------------------------------------------
-# 5. GOOGLE SHEETS ASYNC BACKGROUND SYNC (With Photo URL Support)
+# 5. GOOGLE SHEETS ASYNC BACKGROUND SYNC (With Clean Photo URL)
 # ---------------------------------------------------------------------------
 class SheetsSyncManager:
     def __init__(self, webhook_url: Optional[str] = None):
@@ -431,8 +452,15 @@ async def save_tg_photo(file_id: str, context: ContextTypes.DEFAULT_TYPE, prefix
         file_path = str(PHOTOS_DIR / filename)
         await tg_file.download_to_drive(custom_path=file_path)
         
-        # Build direct telegram photo link if file_path available
-        photo_url = f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}/{tg_file.file_path}" if tg_file.file_path else ""
+        # Clean photo_url (Avoid duplicate prefix)
+        raw_path = tg_file.file_path or ""
+        if raw_path.startswith("http"):
+            photo_url = raw_path
+        elif raw_path:
+            photo_url = f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}/{raw_path.lstrip('/')}"
+        else:
+            photo_url = ""
+            
         return file_path, photo_url
     except Exception as e:
         logger.error(f"Error saving photo: {e}")
