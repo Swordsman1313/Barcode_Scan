@@ -1,14 +1,12 @@
 """
 =============================================================================
-STORE STOCK COUNT TELEGRAM BOT — AI VISION PACKAGING NAME DETECTOR
+STORE STOCK COUNT TELEGRAM BOT — CLEAN & FULLY AUTOMATED EDITION
 =============================================================================
-- Auto-catches Product Name directly from packaging photo (Gemini AI Vision)
-- Auto-detects Barcodes from photos (zxing-cpp)
-- Manual Shelf & Quantity input
-- Smart "Keep Last Shelf" button for fast repeat scans
-- Real-time Google Sheets Auto-Fill via Webhook
-- Instant Excel (.xlsx) Export
-- 24/7 Cloud Ready
+- REMOVED UNNECESSARY BUTTONS: Clean, clutter-free chat interface
+- 100% AUTOMATED PRODUCT NAME: AI Vision extracts product name in background
+- NEVER ASKS CREW TO TYPE ITEM NAME
+- FAST 3-STEP FLOW: Photo -> Shelf -> Quantity -> Saved & Synced!
+- SUPPORTS GROUP CHATS & PRIVATE CHATS
 =============================================================================
 """
 
@@ -45,8 +43,7 @@ from telegram import (
     Update,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
-    ReplyKeyboardMarkup,
-    KeyboardButton
+    ReplyKeyboardRemove
 )
 from telegram.ext import (
     Application,
@@ -79,28 +76,17 @@ logging.basicConfig(
 )
 logger = logging.getLogger("StockBot")
 
+# Conversation States (Streamlined 4 states)
 (
     STATE_BARCODE_PHOTO,
     STATE_SHELF,
     STATE_BARCODE,
-    STATE_ITEM_NAME,
     STATE_QTY
-) = range(5)
+) = range(4)
 
 
 # ---------------------------------------------------------------------------
-# 2. KEYBOARDS
-# ---------------------------------------------------------------------------
-def get_main_reply_keyboard() -> ReplyKeyboardMarkup:
-    keyboard = [
-        [KeyboardButton("📸 Count New Item"), KeyboardButton("📍 Set Shelf")],
-        [KeyboardButton("📊 Export Excel"), KeyboardButton("📈 View Stats")]
-    ]
-    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-
-
-# ---------------------------------------------------------------------------
-# 3. DATABASE LAYER (SQLite WAL Mode)
+# 2. DATABASE LAYER (SQLite WAL Mode)
 # ---------------------------------------------------------------------------
 def get_current_timestamp() -> str:
     try:
@@ -265,60 +251,60 @@ async def db_get_summary_stats() -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# 4. AI VISION PRODUCT NAME EXTRACTOR (Auto-Catch Name from Packaging)
+# 3. AI VISION PRODUCT NAME EXTRACTOR (Auto-Catch Name from Packaging)
 # ---------------------------------------------------------------------------
 async def extract_product_name_from_image(image_path: str) -> Optional[str]:
     """
     Uses Gemini AI Vision to automatically detect product name from packaging.
-    Returns concise Brand & Product Name (e.g. 'Jardo Seaweed Rice Chip', 'Coca Cola 325ml').
+    Tries gemini-1.5-flash, gemini-2.0-flash, gemini-2.5-flash with robust fallback.
     """
     if not image_path or not os.path.exists(image_path):
         return None
 
     api_key = os.getenv("GEMINI_API_KEY", "").strip()
     if not api_key:
+        logger.info("ℹ️ GEMINI_API_KEY not set. Add it in Render Environment to enable auto product naming.")
         return None
 
     try:
         with open(image_path, "rb") as f:
             img_b64 = base64.b64encode(f.read()).decode("utf-8")
 
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={api_key}"
-        payload = {
-            "contents": [{
-                "parts": [
-                    {
-                        "text": (
-                            "Look at this product packaging image. Identify and extract ONLY the Brand and Product Name "
-                            "(including flavor or size if visible). Return ONLY the product name (maximum 6 words). "
-                            "Do not include markdown, quotes, bullet points, or filler words. "
-                            "Example output: 'Jardo Seaweed Rice Chip' or 'Lay's Classic 50g' or 'Coca Cola 325ml'."
-                        )
-                    },
-                    {
-                        "inlineData": {
-                            "mimeType": "image/jpeg",
-                            "data": img_b64
-                        }
-                    }
-                ]
-            }]
-        }
+        prompt = (
+            "Look at this snack/food/product packaging image. Extract ONLY the Brand and Product Name "
+            "(including flavor or size if clearly visible). Output concise name in max 5 words. "
+            "Do NOT include markdown, quotes, bullet points, or extra text. "
+            "Example: 'Jardo Seaweed Rice Chip' or 'Lay's Classic 50g' or 'Coca Cola 325ml'."
+        )
 
-        async with aiohttp.ClientSession() as session:
-            async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=8)) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    candidates = data.get("candidates", [])
-                    if candidates:
-                        text = candidates[0].get("content", {}).get("parts", [{}])[0].get("text", "")
-                        clean_name = text.strip().replace("\n", " ").replace("*", "").replace('"', '').strip()
-                        if clean_name and len(clean_name) > 2:
-                            logger.info(f"✨ AI detected product name: {clean_name}")
-                            return clean_name
-                else:
-                    err_text = await resp.text()
-                    logger.warning(f"Gemini API returned status {resp.status}: {err_text}")
+        models = ["gemini-1.5-flash", "gemini-2.0-flash", "gemini-2.5-flash"]
+        for model in models:
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
+            payload = {
+                "contents": [{
+                    "parts": [
+                        {"text": prompt},
+                        {"inlineData": {"mimeType": "image/jpeg", "data": img_b64}}
+                    ]
+                }]
+            }
+
+            async with aiohttp.ClientSession() as session:
+                async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=8)) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        candidates = data.get("candidates", [])
+                        if candidates:
+                            text = candidates[0].get("content", {}).get("parts", [{}])[0].get("text", "")
+                            clean_name = text.strip().replace("\n", " ").replace("*", "").replace('"', '').strip()
+                            if clean_name and len(clean_name) > 2:
+                                logger.info(f"✨ AI extracted product name: {clean_name}")
+                                return clean_name
+                    elif resp.status == 404:
+                        continue
+                    else:
+                        err_text = await resp.text()
+                        logger.warning(f"Gemini API ({model}) returned {resp.status}: {err_text}")
     except Exception as e:
         logger.warning(f"Error extracting product name with AI: {e}")
 
@@ -326,7 +312,7 @@ async def extract_product_name_from_image(image_path: str) -> Optional[str]:
 
 
 # ---------------------------------------------------------------------------
-# 5. BARCODE RECOGNITION (zxing-cpp + PIL)
+# 4. BARCODE RECOGNITION (zxing-cpp + PIL)
 # ---------------------------------------------------------------------------
 def detect_barcode_from_image(image_path: str) -> Optional[str]:
     if not HAS_ZXING or not image_path or not os.path.exists(image_path):
@@ -360,7 +346,7 @@ def detect_barcode_from_image(image_path: str) -> Optional[str]:
 
 
 # ---------------------------------------------------------------------------
-# 6. GOOGLE SHEETS ASYNC BACKGROUND SYNC
+# 5. GOOGLE SHEETS ASYNC BACKGROUND SYNC
 # ---------------------------------------------------------------------------
 class SheetsSyncManager:
     def __init__(self, webhook_url: Optional[str] = None):
@@ -433,7 +419,7 @@ sync_manager = SheetsSyncManager()
 
 
 # ---------------------------------------------------------------------------
-# 7. EXCEL EXPORTER (.xlsx)
+# 6. EXCEL EXPORTER (.xlsx)
 # ---------------------------------------------------------------------------
 def create_excel_report(counts: List[Dict[str, Any]]) -> BytesIO:
     wb = openpyxl.Workbook()
@@ -606,7 +592,7 @@ def create_excel_report(counts: List[Dict[str, Any]]) -> BytesIO:
 
 
 # ---------------------------------------------------------------------------
-# 8. PARSE 1-SHOT CAPTION
+# 7. PARSE 1-SHOT CAPTION
 # ---------------------------------------------------------------------------
 def parse_quick_caption(caption: str, default_shelf: Optional[str] = None, detected_barcode: Optional[str] = None) -> Optional[Tuple[str, str, str, float]]:
     if not caption or not caption.strip():
@@ -650,7 +636,7 @@ def parse_quick_caption(caption: str, default_shelf: Optional[str] = None, detec
 
 
 # ---------------------------------------------------------------------------
-# 9. TELEGRAM HANDLERS
+# 8. TELEGRAM HANDLERS
 # ---------------------------------------------------------------------------
 def get_user_display_name(update: Update) -> str:
     user = update.effective_user
@@ -686,39 +672,32 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"1️⃣ **Just send a photo of the item** 📸\n"
         f"2️⃣ Bot auto-detects **Name & Barcode** ✨\n"
         f"3️⃣ Type your **Shelf & Quantity**!\n\n"
-        f"💡 *Super Fast Pro Tip:*\n"
-        f"Send photo with caption: `G101 8850123456789 12`\n"
-        f"*(It will save instantly in 1 second!)*"
+        f"💡 *Commands:*\n"
+        f"• `/export` — 📊 Download Excel Report\n"
+        f"• `/stats` — 📈 View Summary Stats\n"
+        f"• `/shelf <CODE>` — Set default shelf (e.g. `/shelf G101`)"
     )
     await update.message.reply_text(
         msg,
-        reply_markup=get_main_reply_keyboard(),
+        reply_markup=ReplyKeyboardRemove(),
         parse_mode="Markdown"
     )
 
 
-async def handle_text_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip() if update.message and update.message.text else ""
-
-    if text == "📸 Count New Item":
-        await update.message.reply_text("📸 Please send a photo of the product front:", parse_mode="Markdown")
-    elif text == "📍 Set Shelf":
-        await update.message.reply_text("📍 Please type your **Shelf Code** (e.g. `G101`, `A12`, `B05`):", parse_mode="Markdown")
-        context.user_data["waiting_shelf_direct"] = True
-    elif text == "📊 Export Excel":
-        await cmd_export(update, context)
-    elif text == "📈 View Stats":
-        await cmd_stats(update, context)
-    elif context.user_data.get("waiting_shelf_direct"):
-        context.user_data["waiting_shelf_direct"] = False
-        shelf = text.upper()
-        if update.effective_user:
-            await db_set_user_active_shelf(update.effective_user.id, shelf)
-        await update.message.reply_text(
-            f"✅ *Active shelf set to:* `{shelf}`\n\nAll next items will use `{shelf}` automatically! Send a photo now to count.",
-            reply_markup=get_main_reply_keyboard(),
-            parse_mode="Markdown"
-        )
+async def cmd_shelf(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not user:
+        return
+    if context.args:
+        new_shelf = " ".join(context.args).strip().upper()
+        await db_set_user_active_shelf(user.id, new_shelf)
+        await update.message.reply_text(f"✅ *Active shelf set to:* `{new_shelf}`\nSend a photo to start counting!", parse_mode="Markdown")
+    else:
+        current = await db_get_user_active_shelf(user.id)
+        if current:
+            await update.message.reply_text(f"📍 Current active shelf: `{current}`\nTo change: `/shelf <NEW_SHELF>`", parse_mode="Markdown")
+        else:
+            await update.message.reply_text("📍 No active shelf set. Type: `/shelf <SHELF_CODE>` (e.g. `/shelf G101`)", parse_mode="Markdown")
 
 
 async def cmd_export(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -734,7 +713,6 @@ async def cmd_export(update: Update, context: ContextTypes.DEFAULT_TYPE):
             document=excel_buf,
             filename=filename,
             caption=f"📊 *Stock Count Report*\n• Total Items: `{len(counts)}`\n• Time: `{get_current_timestamp()}`",
-            reply_markup=get_main_reply_keyboard(),
             parse_mode="Markdown"
         )
         await msg.delete()
@@ -763,11 +741,11 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for c in stats["crew_breakdown"]:
             text += f"• {c['crew_name']}: {c['sku_count']} SKUs ({c['total_qty']:,.0f} units)\n"
 
-    await update.message.reply_text(text, reply_markup=get_main_reply_keyboard(), parse_mode="Markdown")
+    await update.message.reply_text(text, parse_mode="Markdown")
 
 
 # ---------------------------------------------------------------------------
-# 10. PHOTO FLOW (Auto-Catch Name from Packaging + Barcode + Shelf + QTY)
+# 9. PHOTO FLOW (Pure Fast Flow: Photo -> Shelf -> Quantity -> Saved)
 # ---------------------------------------------------------------------------
 async def handle_incoming_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data.clear()
@@ -788,6 +766,8 @@ async def handle_incoming_photo(update: Update, context: ContextTypes.DEFAULT_TY
         context.user_data["detected_barcode"] = detected_barcode
     if detected_name:
         context.user_data["item_name"] = detected_name
+    else:
+        context.user_data["item_name"] = "-"
 
     active_shelf = await db_get_user_active_shelf(user.id) if user else None
     caption = update.message.caption or ""
@@ -795,7 +775,6 @@ async def handle_incoming_photo(update: Update, context: ContextTypes.DEFAULT_TY
 
     if quick_data:
         shelf, barcode, name, qty = quick_data
-        # If quick caption did not specify name, use AI detected name if available
         if name == "-" and detected_name:
             name = detected_name
 
@@ -824,12 +803,11 @@ async def handle_incoming_photo(update: Update, context: ContextTypes.DEFAULT_TY
             f"👤 *Crew:* {crew_name}\n"
             f"━━━━━━━━━━━━━━━━━━━━━━\n"
             f"👉 *Send next photo to continue!*",
-            reply_markup=get_main_reply_keyboard(),
             parse_mode="Markdown"
         )
         return ConversationHandler.END
 
-    name_status = f"\n✨ *Auto-detected Name:* `{detected_name}`" if detected_name else ""
+    name_status = f"\n📦 *Item:* `{detected_name}` (Auto-detected ✨)" if detected_name else ""
 
     kb = InlineKeyboardMarkup([[InlineKeyboardButton("⏩ Skip (Barcode is in this photo)", callback_data="skip_barcode_photo")]])
     await update.message.reply_text(
@@ -876,7 +854,7 @@ async def prompt_shelf_step(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         )
     else:
         await target.reply_text(
-            "📍 *Please type the Shelf Code* (e.g. `G101`, `A12`, `B05`, etc.):",
+            "📍 *Please type the Shelf Code* (e.g. `G101`, `A12`, `B05`):",
             parse_mode="Markdown"
         )
     return STATE_SHELF
@@ -890,7 +868,7 @@ async def flow_shelf_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     if data.startswith("shelf_keep_"):
         shelf = data.replace("shelf_keep_", "").strip().upper()
         context.user_data["shelf"] = shelf
-        return await prompt_barcode_step(update, context)
+        return await check_barcode_and_prompt_qty(update, context)
 
     return STATE_SHELF
 
@@ -903,23 +881,32 @@ async def flow_shelf_text(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     context.user_data["shelf"] = shelf
     if update.effective_user:
         await db_set_user_active_shelf(update.effective_user.id, shelf)
-    return await prompt_barcode_step(update, context)
+    return await check_barcode_and_prompt_qty(update, context)
 
 
-async def prompt_barcode_step(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+async def check_barcode_and_prompt_qty(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """If barcode was already detected from photo, directly prompt for Quantity!"""
+    detected_barcode = context.user_data.get("detected_barcode")
     target = update.callback_query.message if update.callback_query else update.message
-    detected = context.user_data.get("detected_barcode")
-    if detected:
-        kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton(f"✅ Confirm Barcode: {detected}", callback_data=f"confirm_barcode_{detected}")],
-            [InlineKeyboardButton("✏️ Type Different Barcode", callback_data="type_barcode")]
-        ])
-        await target.reply_text(f"🏷️ *Barcode Detected:* `{detected}`\nTap to confirm or type manually:", reply_markup=kb, parse_mode="Markdown")
-    else:
-        kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("⏩ Skip Barcode Number", callback_data="skip_barcode_num")]
-        ])
-        await target.reply_text("🏷️ Please type the **Barcode numbers** from the label:\n_(Or tap Skip):_", reply_markup=kb, parse_mode="Markdown")
+
+    if detected_barcode:
+        context.user_data["barcode"] = detected_barcode
+        await target.reply_text(
+            f"🏷️ *Barcode:* `{detected_barcode}` (Auto-detected ✨)\n\n"
+            f"🔢 *Please type the Quantity (QTY):*\n_(e.g. 1, 5, 12, 24)_",
+            parse_mode="Markdown"
+        )
+        return STATE_QTY
+
+    # If barcode was not auto-detected from photo, ask crew to type it
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("⏩ Skip Barcode Number", callback_data="skip_barcode_num")]
+    ])
+    await target.reply_text(
+        "🏷️ Please type the **Barcode numbers** from the label:\n_(Or tap Skip):_",
+        reply_markup=kb,
+        parse_mode="Markdown"
+    )
     return STATE_BARCODE
 
 
@@ -928,59 +915,17 @@ async def flow_barcode_callback(update: Update, context: ContextTypes.DEFAULT_TY
     await query.answer()
     data = query.data
 
-    if data.startswith("confirm_barcode_"):
-        context.user_data["barcode"] = data.replace("confirm_barcode_", "").strip()
-        return await process_item_name_or_skip(update, context)
-    elif data == "skip_barcode_num":
+    if data == "skip_barcode_num":
         context.user_data["barcode"] = "NO_BARCODE"
-        return await process_item_name_or_skip(update, context)
-    elif data == "type_barcode":
-        await query.message.reply_text("🏷️ Please type the **Barcode number**:", parse_mode="Markdown")
-        return STATE_BARCODE
+        await query.message.reply_text("🔢 *Please type the Quantity (QTY):*\n_(e.g. 1, 5, 12, 24)_", parse_mode="Markdown")
+        return STATE_QTY
+
     return STATE_BARCODE
 
 
 async def flow_barcode_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     barcode = update.message.text.strip()
-    if not barcode:
-        await update.message.reply_text("⚠️ Barcode cannot be empty.")
-        return STATE_BARCODE
-    context.user_data["barcode"] = barcode
-    return await process_item_name_or_skip(update, context)
-
-
-async def process_item_name_or_skip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """If AI already auto-detected the name from packaging, skip asking for name and go straight to Quantity!"""
-    detected_name = context.user_data.get("item_name")
-    target = update.callback_query.message if update.callback_query else update.message
-
-    if detected_name and detected_name != "-":
-        # Name is already caught from packaging! Skip name typing step!
-        await target.reply_text(
-            f"📦 *Product Name:* `{detected_name}` (Auto-detected ✨)\n\n"
-            f"🔢 *Please type the Quantity (QTY):*\n_(e.g. 1, 5, 12, 24)_",
-            parse_mode="Markdown"
-        )
-        return STATE_QTY
-
-    # If AI didn't catch name, give option to type or skip
-    kb = InlineKeyboardMarkup([[InlineKeyboardButton("⏩ Skip Product Name", callback_data="skip_item_name")]])
-    await target.reply_text("📦 Type the **Product Name** (or tap Skip):", reply_markup=kb, parse_mode="Markdown")
-    return STATE_ITEM_NAME
-
-
-async def flow_item_name_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    query = update.callback_query
-    await query.answer()
-    if query.data == "skip_item_name":
-        context.user_data["item_name"] = "-"
-        await query.message.reply_text("🔢 *Please type the Quantity (QTY):*\n_(e.g. 1, 5, 12, 24)_", parse_mode="Markdown")
-        return STATE_QTY
-    return STATE_ITEM_NAME
-
-
-async def flow_item_name_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    context.user_data["item_name"] = update.message.text.strip() or "-"
+    context.user_data["barcode"] = barcode or "NO_BARCODE"
     await update.message.reply_text("🔢 *Please type the Quantity (QTY):*\n_(e.g. 1, 5, 12, 24)_", parse_mode="Markdown")
     return STATE_QTY
 
@@ -1036,19 +981,19 @@ async def finalize_and_save_count(update: Update, context: ContextTypes.DEFAULT_
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
         f"👉 *Send next photo to keep counting on Shelf `{shelf}`!*"
     )
-    await target.reply_text(card, reply_markup=get_main_reply_keyboard(), parse_mode="Markdown")
+    await target.reply_text(card, parse_mode="Markdown")
     context.user_data.clear()
     return ConversationHandler.END
 
 
 async def flow_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data.clear()
-    await update.message.reply_text("❌ Cancelled.", reply_markup=get_main_reply_keyboard(), parse_mode="Markdown")
+    await update.message.reply_text("❌ Cancelled.", parse_mode="Markdown")
     return ConversationHandler.END
 
 
 # ---------------------------------------------------------------------------
-# 11. LIGHTWEIGHT HTTP HEALTH SERVER
+# 10. LIGHTWEIGHT HTTP HEALTH SERVER
 # ---------------------------------------------------------------------------
 async def handle_health_check(request):
     if not TELEGRAM_BOT_TOKEN:
@@ -1065,7 +1010,7 @@ async def handle_health_check(request):
 
 
 # ---------------------------------------------------------------------------
-# 12. MAIN RUNNER
+# 11. MAIN RUNNER
 # ---------------------------------------------------------------------------
 async def main_async():
     logger.info("Initializing SQLite database...")
@@ -1106,13 +1051,8 @@ async def main_async():
                 CommandHandler("cancel", flow_cancel)
             ],
             STATE_BARCODE: [
-                CallbackQueryHandler(flow_barcode_callback, pattern="^(confirm_barcode_|type_barcode|skip_barcode_num)"),
+                CallbackQueryHandler(flow_barcode_callback, pattern="^skip_barcode_num$"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, flow_barcode_text),
-                CommandHandler("cancel", flow_cancel)
-            ],
-            STATE_ITEM_NAME: [
-                CallbackQueryHandler(flow_item_name_callback, pattern="^skip_item_name$"),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, flow_item_name_text),
                 CommandHandler("cancel", flow_cancel)
             ],
             STATE_QTY: [
@@ -1128,9 +1068,9 @@ async def main_async():
     tg_app.add_handler(conv)
     tg_app.add_handler(CommandHandler("start", cmd_start))
     tg_app.add_handler(CommandHandler("help", cmd_start))
+    tg_app.add_handler(CommandHandler("shelf", cmd_shelf))
     tg_app.add_handler(CommandHandler("export", cmd_export))
     tg_app.add_handler(CommandHandler("stats", cmd_stats))
-    tg_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_buttons))
 
     await tg_app.initialize()
     await tg_app.start()
