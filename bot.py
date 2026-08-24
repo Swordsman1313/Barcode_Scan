@@ -1,20 +1,19 @@
 """
 =============================================================================
-STORE STOCK COUNT TELEGRAM BOT — ALL-IN-ONE (FREE CLOUD WEB SERVICE READY)
+STORE STOCK COUNT TELEGRAM BOT — ULTRA-SIMPLE CREW & GROUP EDITION
 =============================================================================
 Features:
-- Multi-user concurrency for many store crew members counting simultaneously
-- Sticky shelf memory (/shelf G101)
-- Dual photo capture (Front of item + Barcode)
-- Smart auto barcode detection (zxing-cpp) with manual typing fallback
-- Fast Quantity selection buttons (1, 2, 5, 10, 12, 24, Custom)
-- Real-time Google Sheets auto-fill via Webhook (async background queue)
-- Beautiful 3-tab Excel (.xlsx) export (/export)
-- Built-in lightweight health check web server on $PORT for Render/Railway $0 Free Tier
+- ZERO COMMANDS NEEDED: Big touch buttons at bottom of screen
+- FULL TELEGRAM GROUP CHAT SUPPORT: Add bot to store crew group
+- 1-SHOT QUICK CAPTION MODE: Send photo with caption "G101 8850123456789 Coke 12" -> Auto-saved in 1 second!
+- STEP-BY-STEP GUIDED MODE: Big interactive buttons for shelf & quantity
+- REAL-TIME GOOGLE SHEETS & EXCEL EXPORT: Auto-syncs live + 1-tap Excel download
+- BUILT-IN WEB SERVER: Runs 24/7 on Render $0 Free Tier
 =============================================================================
 """
 
 import os
+import re
 import uuid
 import asyncio
 import logging
@@ -23,7 +22,7 @@ from io import BytesIO
 from datetime import datetime
 from pathlib import Path
 from contextlib import asynccontextmanager
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Tuple
 
 from dotenv import load_dotenv
 from PIL import Image, ImageEnhance, ImageOps
@@ -38,7 +37,9 @@ from openpyxl.utils import get_column_letter
 from telegram import (
     Update,
     InlineKeyboardButton,
-    InlineKeyboardMarkup
+    InlineKeyboardMarkup,
+    ReplyKeyboardMarkup,
+    KeyboardButton
 )
 from telegram.ext import (
     Application,
@@ -64,13 +65,6 @@ PHOTOS_DIR.mkdir(parents=True, exist_ok=True)
 TIMEZONE = os.getenv("TIMEZONE", "Asia/Bangkok")
 PORT = int(os.getenv("PORT", "8080"))
 
-ADMIN_IDS_RAW = os.getenv("ADMIN_USER_IDS", "").strip()
-ADMIN_USER_IDS = set()
-if ADMIN_IDS_RAW:
-    for uid in ADMIN_IDS_RAW.split(","):
-        if uid.strip().isdigit():
-            ADMIN_USER_IDS.add(int(uid.strip()))
-
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO
@@ -79,17 +73,55 @@ logger = logging.getLogger("StockBot")
 
 # Conversation States
 (
-    STATE_FRONT_PHOTO,
     STATE_BARCODE_PHOTO,
     STATE_SHELF,
     STATE_BARCODE,
     STATE_ITEM_NAME,
     STATE_QTY
-) = range(6)
+) = range(5)
 
 
 # ---------------------------------------------------------------------------
-# 2. DATABASE LAYER (SQLite WAL Mode)
+# 2. PERMANENT BUTTON KEYBOARD (Zero Commands Needed)
+# ---------------------------------------------------------------------------
+def get_main_reply_keyboard() -> ReplyKeyboardMarkup:
+    """Big bottom touch buttons so crew never needs to type /commands."""
+    keyboard = [
+        [KeyboardButton("📸 Count New Item"), KeyboardButton("📍 Set Shelf")],
+        [KeyboardButton("📊 Export Excel"), KeyboardButton("📈 View Stats")]
+    ]
+    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+
+
+def get_quick_qty_keyboard() -> InlineKeyboardMarkup:
+    """1-tap quantity buttons."""
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("1", callback_data="qty_1"),
+            InlineKeyboardButton("2", callback_data="qty_2"),
+            InlineKeyboardButton("3", callback_data="qty_3"),
+            InlineKeyboardButton("4", callback_data="qty_4"),
+        ],
+        [
+            InlineKeyboardButton("5", callback_data="qty_5"),
+            InlineKeyboardButton("6", callback_data="qty_6"),
+            InlineKeyboardButton("10", callback_data="qty_10"),
+            InlineKeyboardButton("12", callback_data="qty_12"),
+        ],
+        [
+            InlineKeyboardButton("24", callback_data="qty_24"),
+            InlineKeyboardButton("36", callback_data="qty_36"),
+            InlineKeyboardButton("48", callback_data="qty_48"),
+            InlineKeyboardButton("100", callback_data="qty_100"),
+        ],
+        [
+            InlineKeyboardButton("✏️ Type Number", callback_data="qty_custom")
+        ]
+    ])
+
+
+# ---------------------------------------------------------------------------
+# 3. DATABASE LAYER (SQLite WAL Mode)
 # ---------------------------------------------------------------------------
 def get_current_timestamp() -> str:
     try:
@@ -145,9 +177,9 @@ async def init_db():
 
 async def db_insert_count(user_id: int, crew_name: str, shelf: str, barcode: str, item_name: str, qty: float, photo_front: str = None, photo_barcode: str = None) -> Dict[str, Any]:
     timestamp = get_current_timestamp()
-    shelf_clean = shelf.strip().upper()
-    barcode_clean = str(barcode).strip()
-    item_name_clean = (item_name or "").strip()
+    shelf_clean = (shelf or "UNKNOWN").strip().upper()
+    barcode_clean = str(barcode or "NO_BARCODE").strip()
+    item_name_clean = (item_name or "-").strip()
 
     async with get_db() as db:
         cursor = await db.execute(
@@ -209,7 +241,7 @@ async def db_get_all_counts() -> List[Dict[str, Any]]:
             return [dict(r) for r in rows]
 
 
-async def db_get_recent_counts(user_id: Optional[int] = None, limit: int = 10) -> List[Dict[str, Any]]:
+async def db_get_recent_counts(user_id: Optional[int] = None, limit: int = 8) -> List[Dict[str, Any]]:
     async with get_db() as db:
         if user_id:
             query = "SELECT * FROM counts WHERE user_id = ? ORDER BY id DESC LIMIT ?"
@@ -277,7 +309,7 @@ async def db_delete_count(count_id: int, user_id: Optional[int] = None) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# 3. BARCODE RECOGNITION (zxing-cpp + PIL)
+# 4. BARCODE RECOGNITION (zxing-cpp + PIL)
 # ---------------------------------------------------------------------------
 def detect_barcode_from_image(image_path: str) -> Optional[str]:
     if not image_path or not os.path.exists(image_path):
@@ -311,7 +343,7 @@ def detect_barcode_from_image(image_path: str) -> Optional[str]:
 
 
 # ---------------------------------------------------------------------------
-# 4. GOOGLE SHEETS ASYNC BACKGROUND SYNC
+# 5. GOOGLE SHEETS ASYNC BACKGROUND SYNC
 # ---------------------------------------------------------------------------
 class SheetsSyncManager:
     def __init__(self, webhook_url: Optional[str] = None):
@@ -396,7 +428,7 @@ sync_manager = SheetsSyncManager()
 
 
 # ---------------------------------------------------------------------------
-# 5. EXCEL EXPORTER (.xlsx)
+# 6. EXCEL EXPORTER (.xlsx)
 # ---------------------------------------------------------------------------
 def create_excel_report(counts: List[Dict[str, Any]]) -> BytesIO:
     wb = openpyxl.Workbook()
@@ -572,7 +604,7 @@ def create_excel_report(counts: List[Dict[str, Any]]) -> BytesIO:
 
 
 # ---------------------------------------------------------------------------
-# 6. LIGHTWEIGHT HTTP HEALTH SERVER (Allows Render $0 Free Web Service)
+# 7. LIGHTWEIGHT HTTP HEALTH SERVER (Allows Render $0 Free Web Service)
 # ---------------------------------------------------------------------------
 async def handle_health(request):
     return web.Response(text="✅ Store Stock Count Telegram Bot is active and running!", content_type="text/plain")
@@ -590,7 +622,64 @@ async def start_health_web_server():
 
 
 # ---------------------------------------------------------------------------
-# 7. TELEGRAM BOT HANDLERS & STATE MACHINE
+# 8. PARSE 1-SHOT CAPTION (Fastest way for crew)
+# ---------------------------------------------------------------------------
+def parse_quick_caption(caption: str, default_shelf: Optional[str] = None, detected_barcode: Optional[str] = None) -> Optional[Tuple[str, str, str, float]]:
+    """
+    Parses natural captions like:
+    1. "G101 8850123456789 Coke 12" -> Shelf: G101, Barcode: 8850123456789, Name: Coke, Qty: 12
+    2. "G101 8850123456789 24" -> Shelf: G101, Barcode: 8850123456789, Name: "-", Qty: 24
+    3. "G101 12" (if barcode auto-detected) -> Shelf: G101, Barcode: detected, Name: "-", Qty: 12
+    4. "12" (if active shelf and barcode detected) -> Shelf: default, Barcode: detected, Name: "-", Qty: 12
+    """
+    if not caption or not caption.strip():
+        return None
+
+    tokens = caption.strip().split()
+    if not tokens:
+        return None
+
+    shelf = default_shelf or "UNKNOWN"
+    barcode = detected_barcode or "NO_BARCODE"
+    item_name = "-"
+    qty = 1.0
+
+    # Case: only a number e.g. "12"
+    if len(tokens) == 1 and tokens[0].replace(".", "", 1).isdigit():
+        qty = float(tokens[0])
+        return shelf, barcode, item_name, qty
+
+    # Check last token as QTY
+    last_token = tokens[-1]
+    if last_token.replace(".", "", 1).isdigit():
+        qty = float(last_token)
+        tokens = tokens[:-1]
+
+    if not tokens:
+        return shelf, barcode, item_name, qty
+
+    # Check first token as Shelf (e.g. G101, A02, B12, Shelf1)
+    if re.match(r"^[A-Za-z0-9\-_]{2,6}$", tokens[0]) and not tokens[0].isdigit():
+        shelf = tokens[0].upper()
+        tokens = tokens[1:]
+
+    if not tokens:
+        return shelf, barcode, item_name, qty
+
+    # Check next token as Barcode (e.g. 8850123456789)
+    if tokens[0].isdigit() and len(tokens[0]) >= 6:
+        barcode = tokens[0]
+        tokens = tokens[1:]
+
+    # Any remaining tokens become Item Name
+    if tokens:
+        item_name = " ".join(tokens)
+
+    return shelf, barcode, item_name, qty
+
+
+# ---------------------------------------------------------------------------
+# 9. TELEGRAM HANDLERS (Simple Buttons & Group Support)
 # ---------------------------------------------------------------------------
 def get_user_display_name(update: Update) -> str:
     user = update.effective_user
@@ -614,157 +703,69 @@ async def save_tg_photo(file_id: str, context: ContextTypes.DEFAULT_TYPE, prefix
         return ""
 
 
-def get_quick_qty_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("1", callback_data="qty_1"),
-            InlineKeyboardButton("2", callback_data="qty_2"),
-            InlineKeyboardButton("3", callback_data="qty_3"),
-            InlineKeyboardButton("4", callback_data="qty_4"),
-        ],
-        [
-            InlineKeyboardButton("5", callback_data="qty_5"),
-            InlineKeyboardButton("6", callback_data="qty_6"),
-            InlineKeyboardButton("10", callback_data="qty_10"),
-            InlineKeyboardButton("12", callback_data="qty_12"),
-        ],
-        [
-            InlineKeyboardButton("24", callback_data="qty_24"),
-            InlineKeyboardButton("36", callback_data="qty_36"),
-            InlineKeyboardButton("48", callback_data="qty_48"),
-            InlineKeyboardButton("100", callback_data="qty_100"),
-        ],
-        [
-            InlineKeyboardButton("✏️ Type Custom Number", callback_data="qty_custom")
-        ]
-    ])
-
-
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Simple friendly greeting with big touch buttons."""
     user = update.effective_user
     active_shelf = await db_get_user_active_shelf(user.id) if user else None
-    shelf_text = f"📍 *Active Shelf:* `{active_shelf}`" if active_shelf else "📍 *Active Shelf:* _Not set yet_"
+    shelf_display = f"`{active_shelf}`" if active_shelf else "_Not set_"
 
     msg = (
-        f"👋 *Store Stock Count Bot*\n\n"
-        f"{shelf_text}\n\n"
-        f"🚀 *How to Count Stock:*\n"
-        f"1️⃣ **Send a photo of the item** (or type /count)\n"
-        f"2️⃣ Send or skip barcode photo\n"
-        f"3️⃣ Confirm/Type Shelf (e.g. `G101`)\n"
-        f"4️⃣ Confirm/Type Barcode number\n"
-        f"5️⃣ Enter Item Name\n"
-        f"6️⃣ Select/Type Quantity (QTY)\n\n"
-        f"📌 *Commands:*\n"
-        f"• `/shelf <code?>` — Set active shelf (e.g. `/shelf G101`)\n"
-        f"• `/mycounts` — View your last counted items\n"
-        f"• `/delete_last` — Delete your most recent count\n"
-        f"• `/stats` — View total count summary\n"
-        f"• `/export` — 📊 Download Excel (.xlsx) report\n"
-        f"• `/sync` — Sync pending items to Google Sheets\n"
-        f"• `/cancel` — Cancel current count\n\n"
-        f"👉 *Send a photo now to begin counting!*"
+        f"👋 *Welcome to Store Stock Count Bot!*\n\n"
+        f"📍 *Your Shelf:* {shelf_display}\n\n"
+        f"👉 *How to count an item:*\n"
+        f"1️⃣ **Just send a photo of the item** 📸\n"
+        f"2️⃣ Tap the buttons on your screen to pick Shelf & QTY!\n\n"
+        f"💡 *Super Fast Pro Tip:*\n"
+        f"Send photo with caption: `G101 8850123456789 Coke 12`\n"
+        f"*(It will save instantly in 1 second!)*"
     )
-    await update.message.reply_text(msg, parse_mode="Markdown")
-
-
-async def cmd_shelf(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    if not user:
-        return
-    if context.args:
-        new_shelf = " ".join(context.args).strip().upper()
-        await db_set_user_active_shelf(user.id, new_shelf)
-        await update.message.reply_text(f"✅ *Active shelf updated to:* `{new_shelf}`\nSend an item photo to start counting!", parse_mode="Markdown")
-    else:
-        current = await db_get_user_active_shelf(user.id)
-        if current:
-            await update.message.reply_text(f"📍 Current active shelf: `{current}`\nTo change: `/shelf <NEW_SHELF>`", parse_mode="Markdown")
-        else:
-            await update.message.reply_text("📍 No active shelf set. Type: `/shelf <SHELF_CODE>` (e.g. `/shelf G101`)", parse_mode="Markdown")
-
-
-async def cmd_mycounts(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    if not user:
-        return
-    records = await db_get_recent_counts(user_id=user.id, limit=8)
-    if not records:
-        await update.message.reply_text("ℹ️ No items recorded yet. Send a photo to start!", parse_mode="Markdown")
-        return
-    text = "📋 *Your Recent Scanned Items:*\n\n"
-    for r in records:
-        synced = "✅" if r.get("synced_sheet") == 1 else "⏳"
-        text += f"• *ID #{r['id']}* — `{r['shelf']}` | `{r['barcode']}`\n   📦 {r.get('item_name') or 'No Name'} (x{r['qty']}) {synced}\n\n"
-    text += "To delete a mistake, type `/delete <ID>` or `/delete_last`"
-    await update.message.reply_text(text, parse_mode="Markdown")
-
-
-async def cmd_delete_last(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    if not user:
-        return
-    records = await db_get_recent_counts(user_id=user.id, limit=1)
-    if not records:
-        await update.message.reply_text("❌ No items found to delete.")
-        return
-    last_item = records[0]
-    if await db_delete_count(last_item["id"], user_id=user.id):
-        await update.message.reply_text(f"🗑️ Deleted ID #{last_item['id']} ({last_item['shelf']} | {last_item['barcode']})")
-    else:
-        await update.message.reply_text("❌ Failed to delete entry.")
-
-
-async def cmd_delete_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    if not user or not context.args or not context.args[0].isdigit():
-        await update.message.reply_text("Usage: `/delete <ID>`", parse_mode="Markdown")
-        return
-    count_id = int(context.args[0])
-    is_admin = user.id in ADMIN_USER_IDS
-    if await db_delete_count(count_id, user_id=None if is_admin else user.id):
-        await update.message.reply_text(f"🗑️ Deleted item ID #{count_id}")
-    else:
-        await update.message.reply_text(f"❌ Could not delete item #{count_id}")
-
-
-async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    stats = await db_get_summary_stats()
-    text = (
-        f"📊 *STOCK COUNT SUMMARY STATS*\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"📦 *Total SKUs Counted:* `{stats['total_skus']}`\n"
-        f"🔢 *Total Units (Qty):* `{stats['total_qty']:,.0f}`\n"
-        f"🏢 *Total Shelves:* `{stats['total_shelves']}`\n"
-        f"🌐 *Pending Sheet Sync:* `{stats['pending_sync']}`\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
+    await update.message.reply_text(
+        msg,
+        reply_markup=get_main_reply_keyboard(),
+        parse_mode="Markdown"
     )
-    if stats["shelf_breakdown"]:
-        text += "🏢 *By Shelf:*\n"
-        for s in stats["shelf_breakdown"][:8]:
-            text += f"• `{s['shelf']}`: {s['sku_count']} SKUs ({s['total_qty']:,.0f} units)\n"
-        text += "\n"
-    if stats["crew_breakdown"]:
-        text += "👤 *By Crew:*\n"
-        for c in stats["crew_breakdown"]:
-            text += f"• {c['crew_name']}: {c['sku_count']} SKUs ({c['total_qty']:,.0f} units)\n"
-    text += "\n👉 Type `/export` to download Excel report!"
-    await update.message.reply_text(text, parse_mode="Markdown")
+
+
+async def handle_text_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles clicks on the large reply keyboard buttons."""
+    text = update.message.text.strip() if update.message and update.message.text else ""
+
+    if text == "📸 Count New Item":
+        await update.message.reply_text("📸 Please send a photo of the product front:", parse_mode="Markdown")
+    elif text == "📍 Set Shelf":
+        await update.message.reply_text("📍 Please type your **Shelf Code** (e.g. `G101`):", parse_mode="Markdown")
+        context.user_data["waiting_shelf_direct"] = True
+    elif text == "📊 Export Excel":
+        await cmd_export(update, context)
+    elif text == "📈 View Stats":
+        await cmd_stats(update, context)
+    elif context.user_data.get("waiting_shelf_direct"):
+        context.user_data["waiting_shelf_direct"] = False
+        shelf = text.upper()
+        if update.effective_user:
+            await db_set_user_active_shelf(update.effective_user.id, shelf)
+        await update.message.reply_text(
+            f"✅ *Shelf locked to:* `{shelf}`\n\nAll next items will use `{shelf}` automatically! Send a photo now to count.",
+            reply_markup=get_main_reply_keyboard(),
+            parse_mode="Markdown"
+        )
 
 
 async def cmd_export(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = await update.message.reply_text("⏳ *Generating Excel report...*", parse_mode="Markdown")
+    """Generates and sends Excel report."""
+    msg = await update.message.reply_text("⏳ *Generating Excel file...*", parse_mode="Markdown")
     try:
         counts = await db_get_all_counts()
         if not counts:
             await msg.edit_text("ℹ️ No items recorded yet.")
             return
         excel_buf = create_excel_report(counts)
-        filename = f"Stock_Count_Report_{get_current_timestamp().replace(':', '-').replace(' ', '_')}.xlsx"
+        filename = f"Stock_Count_{get_current_timestamp().replace(':', '-').replace(' ', '_')}.xlsx"
         await update.message.reply_document(
             document=excel_buf,
             filename=filename,
-            caption=f"📊 *Stock Report Exported!*\n• Total Items: `{len(counts)}`\n• Time: `{get_current_timestamp()}`",
+            caption=f"📊 *Stock Count Report*\n• Total Items: `{len(counts)}`\n• Time: `{get_current_timestamp()}`",
+            reply_markup=get_main_reply_keyboard(),
             parse_mode="Markdown"
         )
         await msg.delete()
@@ -773,46 +774,94 @@ async def cmd_export(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await msg.edit_text(f"❌ Error generating Excel: {e}")
 
 
-async def cmd_sync(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not GOOGLE_SHEET_WEBHOOK_URL:
-        await update.message.reply_text("⚠️ Google Sheet Webhook URL is not configured in `.env`.", parse_mode="Markdown")
-        return
-    msg = await update.message.reply_text("⏳ *Syncing pending items to Google Sheets...*", parse_mode="Markdown")
-    count = await sync_manager.sync_pending_records()
-    await msg.edit_text(f"✅ *Sync Complete:* `{count}` pending items pushed to Google Sheets.", parse_mode="Markdown")
+async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    stats = await db_get_summary_stats()
+    text = (
+        f"📊 *STOCK COUNT SUMMARY*\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"📦 *Total SKUs Counted:* `{stats['total_skus']}`\n"
+        f"🔢 *Total Units (Qty):* `{stats['total_qty']:,.0f}`\n"
+        f"🏢 *Total Shelves:* `{stats['total_shelves']}`\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
+    )
+    if stats["shelf_breakdown"]:
+        text += "🏢 *By Shelf:*\n"
+        for s in stats["shelf_breakdown"][:6]:
+            text += f"• `{s['shelf']}`: {s['sku_count']} SKUs ({s['total_qty']:,.0f} units)\n"
+        text += "\n"
+    if stats["crew_breakdown"]:
+        text += "👤 *By Crew:*\n"
+        for c in stats["crew_breakdown"]:
+            text += f"• {c['crew_name']}: {c['sku_count']} SKUs ({c['total_qty']:,.0f} units)\n"
+
+    await update.message.reply_text(text, reply_markup=get_main_reply_keyboard(), parse_mode="Markdown")
 
 
-# Conversation Flow
-async def flow_start_count(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+# ---------------------------------------------------------------------------
+# 10. PHOTO HANDLER (1-Shot Caption OR Step-by-Step Flow)
+# ---------------------------------------------------------------------------
+async def handle_incoming_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Entry point when crew sends a photo."""
     context.user_data.clear()
-    if update.message and update.message.photo:
-        photo = update.message.photo[-1]
-        file_path = await save_tg_photo(photo.file_id, context, prefix="front")
-        context.user_data["photo_front"] = file_path
-        detected = detect_barcode_from_image(file_path)
-        if detected:
-            context.user_data["detected_barcode"] = detected
+    user = update.effective_user
+    crew_name = get_user_display_name(update)
 
-        kb = InlineKeyboardMarkup([[InlineKeyboardButton("⏩ Skip (Barcode is in this photo)", callback_data="skip_barcode_photo")]])
-        await update.message.reply_text("📸 *Front Photo Saved!*\n\nNow send a close-up photo of the **Barcode label** (or tap Skip):", reply_markup=kb, parse_mode="Markdown")
-        return STATE_BARCODE_PHOTO
-
-    await update.message.reply_text("📸 *Step 1/5: Item Photo*\n\nPlease send a photo of the **Front of the product**:", parse_mode="Markdown")
-    return STATE_FRONT_PHOTO
-
-
-async def flow_receive_front_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    if not update.message.photo:
-        await update.message.reply_text("⚠️ Please send a photo.")
-        return STATE_FRONT_PHOTO
     photo = update.message.photo[-1]
     file_path = await save_tg_photo(photo.file_id, context, prefix="front")
     context.user_data["photo_front"] = file_path
+
+    # Try auto-detecting barcode from photo
     detected = detect_barcode_from_image(file_path)
     if detected:
         context.user_data["detected_barcode"] = detected
+
+    active_shelf = await db_get_user_active_shelf(user.id) if user else None
+
+    # Check if crew wrote a 1-shot caption (e.g. "G101 8850123456789 Coke 12" or "G101 24")
+    caption = update.message.caption or ""
+    quick_data = parse_quick_caption(caption, default_shelf=active_shelf, detected_barcode=detected)
+
+    if quick_data:
+        shelf, barcode, name, qty = quick_data
+        # Fast save in 1 second!
+        record = await db_insert_count(
+            user_id=user.id if user else 0,
+            crew_name=crew_name,
+            shelf=shelf,
+            barcode=barcode,
+            item_name=name,
+            qty=qty,
+            photo_front=file_path
+        )
+        if user and shelf and shelf != "UNKNOWN":
+            await db_set_user_active_shelf(user.id, shelf)
+
+        sync_manager.enqueue(record)
+        qty_display = int(qty) if qty.is_integer() else qty
+
+        await update.message.reply_text(
+            f"⚡ *SAVED IN 1 SECOND! (ID #{record['id']})*\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"📍 *Shelf:* `{shelf}`\n"
+            f"🏷️ *Barcode:* `{barcode}`\n"
+            f"📦 *Item:* {name}\n"
+            f"🔢 *Quantity:* `{qty_display}`\n"
+            f"👤 *Crew:* {crew_name}\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"👉 *Send next photo to continue!*",
+            reply_markup=get_main_reply_keyboard(),
+            parse_mode="Markdown"
+        )
+        return ConversationHandler.END
+
+    # Guided Step-by-Step mode
     kb = InlineKeyboardMarkup([[InlineKeyboardButton("⏩ Skip (Barcode is in this photo)", callback_data="skip_barcode_photo")]])
-    await update.message.reply_text("📸 *Front Photo Saved!*\n\nNow send a photo of the **Barcode label** (or tap Skip):", reply_markup=kb, parse_mode="Markdown")
+    await update.message.reply_text(
+        "📸 *Photo Received!*\n\n"
+        "Send a close-up photo of the **Barcode label** (or tap Skip below):",
+        reply_markup=kb,
+        parse_mode="Markdown"
+    )
     return STATE_BARCODE_PHOTO
 
 
@@ -844,9 +893,9 @@ async def prompt_shelf_step(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             [InlineKeyboardButton(f"✅ Keep Shelf {active_shelf}", callback_data=f"keep_shelf_{active_shelf}")],
             [InlineKeyboardButton("✏️ Enter Different Shelf", callback_data="change_shelf")]
         ])
-        await target.reply_text(f"📍 *Step 2/5: Shelf Location*\n\nCurrent shelf: `{active_shelf}`\nTap below or type new shelf (e.g. `G102`):", reply_markup=kb, parse_mode="Markdown")
+        await target.reply_text(f"📍 *Shelf Location*\n\nCurrent shelf: `{active_shelf}`\nTap below or type new shelf (e.g. `G102`):", reply_markup=kb, parse_mode="Markdown")
     else:
-        await target.reply_text("📍 *Step 2/5: Shelf Location*\n\nPlease type the **Shelf Code** (e.g. `G101`):", parse_mode="Markdown")
+        await target.reply_text("📍 *Shelf Location*\n\nPlease type the **Shelf Code** (e.g. `G101`):", parse_mode="Markdown")
     return STATE_SHELF
 
 
@@ -866,7 +915,7 @@ async def flow_shelf_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
 async def flow_shelf_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     shelf = update.message.text.strip().upper()
     if not shelf:
-        await update.message.reply_text("⚠️ Shelf cannot be empty. Type e.g. `G101`:")
+        await update.message.reply_text("⚠️ Type e.g. `G101`:")
         return STATE_SHELF
     context.user_data["shelf"] = shelf
     if update.effective_user:
@@ -882,9 +931,9 @@ async def prompt_barcode_step(update: Update, context: ContextTypes.DEFAULT_TYPE
             [InlineKeyboardButton(f"✅ Confirm Barcode: {detected}", callback_data=f"confirm_barcode_{detected}")],
             [InlineKeyboardButton("✏️ Type Different Barcode", callback_data="type_barcode")]
         ])
-        await target.reply_text(f"🏷️ *Step 3/5: Barcode Number*\n\n🔍 *Detected from photo:* `{detected}`\nTap to confirm or type manually:", reply_markup=kb, parse_mode="Markdown")
+        await target.reply_text(f"🏷️ *Barcode Number*\n\n🔍 *Detected:* `{detected}`\nTap to confirm or type manually:", reply_markup=kb, parse_mode="Markdown")
     else:
-        await target.reply_text("🏷️ *Step 3/5: Barcode Number*\n\nPlease type the **Barcode number** from the label:", parse_mode="Markdown")
+        await target.reply_text("🏷️ *Barcode Number*\n\nPlease type the **Barcode numbers** from the label:", parse_mode="Markdown")
     return STATE_BARCODE
 
 
@@ -912,7 +961,7 @@ async def flow_barcode_text(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 async def prompt_item_name_step(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     target = update.callback_query.message if update.callback_query else update.message
     kb = InlineKeyboardMarkup([[InlineKeyboardButton("⏩ Skip / No Name", callback_data="skip_item_name")]])
-    await target.reply_text("📦 *Step 4/5: Item Name*\n\nPlease type the **Product Name** (e.g. `Oishi Green Tea 500ml`)\n_(Or tap Skip):_", reply_markup=kb, parse_mode="Markdown")
+    await target.reply_text("📦 *Product Name / Description*\n\nType the **Product Name** (or tap Skip):", reply_markup=kb, parse_mode="Markdown")
     return STATE_ITEM_NAME
 
 
@@ -932,7 +981,7 @@ async def flow_item_name_text(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 async def prompt_qty_step(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     target = update.callback_query.message if update.callback_query else update.message
-    await target.reply_text("🔢 *Step 5/5: Quantity (QTY)*\n\nSelect or type quantity:", reply_markup=get_quick_qty_keyboard(), parse_mode="Markdown")
+    await target.reply_text("🔢 *Select Quantity (QTY):*", reply_markup=get_quick_qty_keyboard(), parse_mode="Markdown")
     return STATE_QTY
 
 
@@ -959,7 +1008,7 @@ async def flow_qty_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         context.user_data["qty"] = qty
         return await finalize_and_save_count(update, context)
     except ValueError:
-        await update.message.reply_text("⚠️ Invalid number. Please enter numeric quantity (e.g. `12`):")
+        await update.message.reply_text("⚠️ Please enter a number (e.g. `12`):")
         return STATE_QTY
 
 
@@ -998,20 +1047,22 @@ async def finalize_and_save_count(update: Update, context: ContextTypes.DEFAULT_
         f"👤 *Crew:* {crew_name}\n"
         f"🕒 *Time:* `{record['timestamp']}`\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"👉 *Send next item photo to keep counting!* 📸\n"
-        f"_(Active shelf is still `{shelf}`)_"
+        f"👉 *Send next photo to keep counting on Shelf `{shelf}`!*"
     )
-    await target.reply_text(card, parse_mode="Markdown")
+    await target.reply_text(card, reply_markup=get_main_reply_keyboard(), parse_mode="Markdown")
     context.user_data.clear()
     return ConversationHandler.END
 
 
 async def flow_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data.clear()
-    await update.message.reply_text("❌ Count cancelled.", parse_mode="Markdown")
+    await update.message.reply_text("❌ Cancelled.", reply_markup=get_main_reply_keyboard(), parse_mode="Markdown")
     return ConversationHandler.END
 
 
+# ---------------------------------------------------------------------------
+# 11. APPLICATION BUILDER
+# ---------------------------------------------------------------------------
 def build_application() -> Application:
     if not TELEGRAM_BOT_TOKEN:
         raise ValueError("TELEGRAM_BOT_TOKEN is empty! Please set it in your .env file.")
@@ -1019,11 +1070,10 @@ def build_application() -> Application:
 
     conv = ConversationHandler(
         entry_points=[
-            CommandHandler("count", flow_start_count),
-            MessageHandler(filters.PHOTO, flow_start_count)
+            MessageHandler(filters.PHOTO, handle_incoming_photo),
+            CommandHandler("count", lambda u, c: u.message.reply_text("📸 Send a photo of the product front:"))
         ],
         states={
-            STATE_FRONT_PHOTO: [MessageHandler(filters.PHOTO, flow_receive_front_photo), CommandHandler("cancel", flow_cancel)],
             STATE_BARCODE_PHOTO: [
                 MessageHandler(filters.PHOTO, flow_receive_barcode_photo),
                 CallbackQueryHandler(flow_skip_barcode_photo_cb, pattern="^skip_barcode_photo$"),
@@ -1058,20 +1108,18 @@ def build_application() -> Application:
     app.add_handler(conv)
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_start))
-    app.add_handler(CommandHandler("shelf", cmd_shelf))
-    app.add_handler(CommandHandler("mycounts", cmd_mycounts))
-    app.add_handler(CommandHandler("delete_last", cmd_delete_last))
-    app.add_handler(CommandHandler("delete", cmd_delete_id))
-    app.add_handler(CommandHandler("stats", cmd_stats))
     app.add_handler(CommandHandler("export", cmd_export))
-    app.add_handler(CommandHandler("sync", cmd_sync))
+    app.add_handler(CommandHandler("stats", cmd_stats))
+
+    # Catch-all for text button clicks (e.g. "📸 Count New Item", "📊 Export Excel")
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_buttons))
+
     return app
 
 
 async def post_init(application: Application):
     await init_db()
     await sync_manager.start()
-    # Start web health server for Render Free Web Service
     await start_health_web_server()
     logger.info("Bot & Web Server Initialized.")
 
