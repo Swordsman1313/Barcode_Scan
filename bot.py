@@ -1,12 +1,12 @@
 """
 =============================================================================
-STORE STOCK COUNT TELEGRAM BOT — CLEAN & FULLY AUTOMATED EDITION
+STORE STOCK SCAN BOT — MINIMAL & ULTRA FAST EDITION
 =============================================================================
-- REMOVED UNNECESSARY BUTTONS: Clean, clutter-free chat interface
-- 100% AUTOMATED PRODUCT NAME: AI Vision extracts product name in background
-- NEVER ASKS CREW TO TYPE ITEM NAME
-- FAST 3-STEP FLOW: Photo -> Shelf -> Quantity -> Saved & Synced!
-- SUPPORTS GROUP CHATS & PRIVATE CHATS
+- Pure 3-Step Flow: Photo -> Shelf -> Quantity -> Real-time Google Sheet!
+- 100% Automated Product Name (Gemini AI Vision)
+- 100% Automated Barcode Detection (zxing-cpp)
+- Real-time Instant Sync to Google Sheets
+- 0 Clutter: No extra buttons, no unnecessary commands
 =============================================================================
 """
 
@@ -17,11 +17,10 @@ import base64
 import asyncio
 import logging
 import zoneinfo
-from io import BytesIO
 from datetime import datetime
 from pathlib import Path
 from contextlib import asynccontextmanager
-from typing import Optional, List, Dict, Any, Tuple
+from typing import Optional, Dict, Any, Tuple
 
 from dotenv import load_dotenv
 from PIL import Image, ImageEnhance, ImageOps
@@ -35,9 +34,6 @@ except ImportError:
 import aiosqlite
 import aiohttp
 from aiohttp import web
-import openpyxl
-from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
-from openpyxl.utils import get_column_letter
 
 from telegram import (
     Update,
@@ -76,13 +72,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger("StockBot")
 
-# Conversation States (Streamlined 4 states)
-(
-    STATE_BARCODE_PHOTO,
-    STATE_SHELF,
-    STATE_BARCODE,
-    STATE_QTY
-) = range(4)
+# Conversation States
+STATE_BARCODE_PHOTO, STATE_SHELF, STATE_BARCODE, STATE_QTY = range(4)
 
 
 # ---------------------------------------------------------------------------
@@ -126,17 +117,7 @@ async def init_db():
                 synced_sheet INTEGER NOT NULL DEFAULT 0
             );
         """)
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS user_preferences (
-                user_id INTEGER PRIMARY KEY,
-                active_shelf TEXT,
-                updated_at TEXT
-            );
-        """)
         await db.execute("CREATE INDEX IF NOT EXISTS idx_counts_shelf ON counts(shelf);")
-        await db.execute("CREATE INDEX IF NOT EXISTS idx_counts_user ON counts(user_id);")
-        await db.execute("CREATE INDEX IF NOT EXISTS idx_counts_barcode ON counts(barcode);")
-        await db.execute("CREATE INDEX IF NOT EXISTS idx_counts_synced ON counts(synced_sheet);")
         await db.commit()
 
 
@@ -173,40 +154,7 @@ async def db_insert_count(user_id: int, crew_name: str, shelf: str, barcode: str
     }
 
 
-async def db_get_user_active_shelf(user_id: int) -> Optional[str]:
-    async with get_db() as db:
-        async with db.execute("SELECT active_shelf FROM user_preferences WHERE user_id = ?", (user_id,)) as cursor:
-            row = await cursor.fetchone()
-            if row and row["active_shelf"]:
-                return row["active_shelf"]
-    return None
-
-
-async def db_set_user_active_shelf(user_id: int, shelf: str):
-    timestamp = get_current_timestamp()
-    shelf_clean = shelf.strip().upper()
-    async with get_db() as db:
-        await db.execute(
-            """
-            INSERT INTO user_preferences (user_id, active_shelf, updated_at)
-            VALUES (?, ?, ?)
-            ON CONFLICT(user_id) DO UPDATE SET
-                active_shelf = excluded.active_shelf,
-                updated_at = excluded.updated_at
-            """,
-            (user_id, shelf_clean, timestamp)
-        )
-        await db.commit()
-
-
-async def db_get_all_counts() -> List[Dict[str, Any]]:
-    async with get_db() as db:
-        async with db.execute("SELECT * FROM counts ORDER BY id ASC") as cursor:
-            rows = await cursor.fetchall()
-            return [dict(r) for r in rows]
-
-
-async def db_mark_synced(count_ids: List[int]):
+async def db_mark_synced(count_ids: list):
     if not count_ids:
         return
     placeholders = ",".join("?" for _ in count_ids)
@@ -215,55 +163,15 @@ async def db_mark_synced(count_ids: List[int]):
         await db.commit()
 
 
-async def db_get_unsynced_counts(limit: int = 50) -> List[Dict[str, Any]]:
-    async with get_db() as db:
-        async with db.execute("SELECT * FROM counts WHERE synced_sheet = 0 ORDER BY id ASC LIMIT ?", (limit,)) as cursor:
-            rows = await cursor.fetchall()
-            return [dict(r) for r in rows]
-
-
-async def db_get_summary_stats() -> Dict[str, Any]:
-    async with get_db() as db:
-        async with db.execute("SELECT COUNT(*) as total_skus, COALESCE(SUM(qty), 0) as total_qty, COUNT(DISTINCT shelf) as total_shelves FROM counts") as c1:
-            r1 = await c1.fetchone()
-            total_skus = r1["total_skus"] if r1 else 0
-            total_qty = r1["total_qty"] if r1 else 0
-            total_shelves = r1["total_shelves"] if r1 else 0
-
-        async with db.execute("SELECT shelf, COUNT(*) as sku_count, SUM(qty) as total_qty FROM counts GROUP BY shelf ORDER BY shelf ASC") as c2:
-            shelf_breakdown = [dict(r) for r in await c2.fetchall()]
-
-        async with db.execute("SELECT crew_name, COUNT(*) as sku_count, SUM(qty) as total_qty FROM counts GROUP BY user_id, crew_name ORDER BY total_qty DESC") as c3:
-            crew_breakdown = [dict(r) for r in await c3.fetchall()]
-
-        async with db.execute("SELECT COUNT(*) as pending FROM counts WHERE synced_sheet = 0") as c4:
-            r4 = await c4.fetchone()
-            pending_sync = r4["pending"] if r4 else 0
-
-    return {
-        "total_skus": total_skus,
-        "total_qty": total_qty,
-        "total_shelves": total_shelves,
-        "pending_sync": pending_sync,
-        "shelf_breakdown": shelf_breakdown,
-        "crew_breakdown": crew_breakdown
-    }
-
-
 # ---------------------------------------------------------------------------
-# 3. AI VISION PRODUCT NAME EXTRACTOR (Auto-Catch Name from Packaging)
+# 3. AI VISION PRODUCT NAME EXTRACTOR (Auto-Catch from Packaging)
 # ---------------------------------------------------------------------------
 async def extract_product_name_from_image(image_path: str) -> Optional[str]:
-    """
-    Uses Gemini AI Vision to automatically detect product name from packaging.
-    Tries gemini-1.5-flash, gemini-2.0-flash, gemini-2.5-flash with robust fallback.
-    """
     if not image_path or not os.path.exists(image_path):
         return None
 
     api_key = os.getenv("GEMINI_API_KEY", "").strip()
     if not api_key:
-        logger.info("ℹ️ GEMINI_API_KEY not set. Add it in Render Environment to enable auto product naming.")
         return None
 
     try:
@@ -271,7 +179,7 @@ async def extract_product_name_from_image(image_path: str) -> Optional[str]:
             img_b64 = base64.b64encode(f.read()).decode("utf-8")
 
         prompt = (
-            "Look at this snack/food/product packaging image. Extract ONLY the Brand and Product Name "
+            "Look at this product packaging image. Extract ONLY the Brand and Product Name "
             "(including flavor or size if clearly visible). Output concise name in max 5 words. "
             "Do NOT include markdown, quotes, bullet points, or extra text. "
             "Example: 'Jardo Seaweed Rice Chip' or 'Lay's Classic 50g' or 'Coca Cola 325ml'."
@@ -302,9 +210,6 @@ async def extract_product_name_from_image(image_path: str) -> Optional[str]:
                                 return clean_name
                     elif resp.status == 404:
                         continue
-                    else:
-                        err_text = await resp.text()
-                        logger.warning(f"Gemini API ({model}) returned {resp.status}: {err_text}")
     except Exception as e:
         logger.warning(f"Error extracting product name with AI: {e}")
 
@@ -419,189 +324,16 @@ sync_manager = SheetsSyncManager()
 
 
 # ---------------------------------------------------------------------------
-# 6. EXCEL EXPORTER (.xlsx)
+# 6. FAST 1-SHOT CAPTION
 # ---------------------------------------------------------------------------
-def create_excel_report(counts: List[Dict[str, Any]]) -> BytesIO:
-    wb = openpyxl.Workbook()
-    HEADER_FILL = PatternFill(start_color="1E3A8A", end_color="1E3A8A", fill_type="solid")
-    HEADER_FONT = Font(name="Calibri", size=11, bold=True, color="FFFFFF")
-    SUBHEADER_FILL = PatternFill(start_color="3B82F6", end_color="3B82F6", fill_type="solid")
-    SUBHEADER_FONT = Font(name="Calibri", size=11, bold=True, color="FFFFFF")
-    ZEBRA_FILL = PatternFill(start_color="F1F5F9", end_color="F1F5F9", fill_type="solid")
-    TOTAL_FILL = PatternFill(start_color="E2E8F0", end_color="E2E8F0", fill_type="solid")
-    TOTAL_FONT = Font(name="Calibri", size=11, bold=True, color="0F172A")
-    BOLD_FONT = Font(name="Calibri", size=11, bold=True, color="1E293B")
-    THIN_BORDER = Border(left=Side(style="thin", color="CBD5E1"), right=Side(style="thin", color="CBD5E1"), top=Side(style="thin", color="CBD5E1"), bottom=Side(style="thin", color="CBD5E1"))
-    DOUBLE_BOTTOM = Border(left=Side(style="thin", color="CBD5E1"), right=Side(style="thin", color="CBD5E1"), top=Side(style="thin", color="CBD5E1"), bottom=Side(style="double", color="1E293B"))
-
-    ws = wb.active
-    ws.title = "Stock Items"
-    ws.views.sheetView[0].showGridLines = True
-    ws.merge_cells("A1:H1")
-    ws["A1"].value = f"📦 STORE STOCK COUNT REPORT — {datetime.now().strftime('%d/%m/%Y %H:%M')}"
-    ws["A1"].font = Font(name="Calibri", size=13, bold=True, color="FFFFFF")
-    ws["A1"].fill = PatternFill(start_color="0F172A", end_color="0F172A", fill_type="solid")
-    ws["A1"].alignment = Alignment(horizontal="center", vertical="center")
-    ws.row_dimensions[1].height = 30
-
-    headers = ["No.", "Date & Time", "Crew Member", "Shelf Location", "Barcode Number", "Item Name / Description", "Quantity", "Sheet Sync"]
-    ws.row_dimensions[2].height = 24
-    for col_idx, h in enumerate(headers, 1):
-        cell = ws.cell(row=2, column=col_idx, value=h)
-        cell.fill = HEADER_FILL
-        cell.font = HEADER_FONT
-        cell.alignment = Alignment(horizontal="center", vertical="center")
-        cell.border = THIN_BORDER
-
-    row_num = 3
-    for idx, item in enumerate(counts, 1):
-        ws.row_dimensions[row_num].height = 20
-        fill = ZEBRA_FILL if idx % 2 == 0 else PatternFill(fill_type=None)
-        
-        c1 = ws.cell(row=row_num, column=1, value=idx)
-        c2 = ws.cell(row=row_num, column=2, value=item.get("timestamp", ""))
-        c3 = ws.cell(row=row_num, column=3, value=item.get("crew_name", ""))
-        c4 = ws.cell(row=row_num, column=4, value=str(item.get("shelf", "")).upper())
-        c4.font = BOLD_FONT
-
-        c5 = ws.cell(row=row_num, column=5, value=str(item.get("barcode", "")))
-        c5.number_format = "@"
-        c5.font = BOLD_FONT
-        c5.alignment = Alignment(horizontal="center", vertical="center")
-
-        c6 = ws.cell(row=row_num, column=6, value=item.get("item_name", "-"))
-        c7 = ws.cell(row=row_num, column=7, value=float(item.get("qty", 0)))
-        c7.number_format = "#,##0"
-        c7.font = BOLD_FONT
-        c7.alignment = Alignment(horizontal="right", vertical="center")
-
-        c8 = ws.cell(row=row_num, column=8, value="✅ Synced" if item.get("synced_sheet") == 1 else "⏳ Pending")
-        c8.alignment = Alignment(horizontal="center", vertical="center")
-
-        for cell in [c1, c2, c3, c4, c5, c6, c7, c8]:
-            if fill.fill_type:
-                cell.fill = fill
-            cell.border = THIN_BORDER
-        row_num += 1
-
-    if counts:
-        ws.row_dimensions[row_num].height = 24
-        ws.merge_cells(start_row=row_num, start_column=1, end_row=row_num, end_column=6)
-        t_label = ws.cell(row=row_num, column=1, value=f"TOTAL ({len(counts)} SKUs Counted)")
-        t_label.font = TOTAL_FONT
-        t_label.fill = TOTAL_FILL
-        t_label.alignment = Alignment(horizontal="right", vertical="center")
-
-        t_val = ws.cell(row=row_num, column=7, value=f"=SUM(G3:G{row_num-1})")
-        t_val.font = TOTAL_FONT
-        t_val.fill = TOTAL_FILL
-        t_val.number_format = "#,##0"
-        t_val.alignment = Alignment(horizontal="right", vertical="center")
-
-        ws.cell(row=row_num, column=8).fill = TOTAL_FILL
-        for col in range(1, 9):
-            ws.cell(row=row_num, column=col).border = DOUBLE_BOTTOM
-        ws.auto_filter.ref = f"A2:H{row_num-1}"
-
-    # Tab 2: Summary by Shelf
-    ws_shelf = wb.create_sheet(title="Summary by Shelf")
-    ws_shelf.views.sheetView[0].showGridLines = True
-    ws_shelf.merge_cells("A1:C1")
-    ws_shelf["A1"].value = "🏢 STOCK BREAKDOWN BY SHELF LOCATION"
-    ws_shelf["A1"].font = Font(name="Calibri", size=12, bold=True, color="FFFFFF")
-    ws_shelf["A1"].fill = PatternFill(start_color="1E293B", end_color="1E293B", fill_type="solid")
-    ws_shelf["A1"].alignment = Alignment(horizontal="center", vertical="center")
-    ws_shelf.row_dimensions[1].height = 28
-
-    s_headers = ["Shelf Location", "Total SKUs (Items)", "Total Quantity Units"]
-    for idx, h in enumerate(s_headers, 1):
-        c = ws_shelf.cell(row=2, column=idx, value=h)
-        c.fill = SUBHEADER_FILL
-        c.font = SUBHEADER_FONT
-        c.alignment = Alignment(horizontal="center", vertical="center")
-        c.border = THIN_BORDER
-
-    shelf_dict = {}
-    for item in counts:
-        s = str(item.get("shelf", "UNKNOWN")).upper()
-        if s not in shelf_dict:
-            shelf_dict[s] = {"skus": 0, "qty": 0.0}
-        shelf_dict[s]["skus"] += 1
-        shelf_dict[s]["qty"] += float(item.get("qty", 0))
-
-    s_row = 3
-    for s_name in sorted(shelf_dict.keys()):
-        d = shelf_dict[s_name]
-        ws_shelf.cell(row=s_row, column=1, value=s_name).font = BOLD_FONT
-        ws_shelf.cell(row=s_row, column=2, value=d["skus"]).alignment = Alignment(horizontal="right")
-        q = ws_shelf.cell(row=s_row, column=3, value=d["qty"])
-        q.alignment = Alignment(horizontal="right")
-        q.font = BOLD_FONT
-        for col in range(1, 4):
-            ws_shelf.cell(row=s_row, column=col).border = THIN_BORDER
-        s_row += 1
-
-    # Tab 3: Summary by Crew
-    ws_crew = wb.create_sheet(title="Summary by Crew")
-    ws_crew.views.sheetView[0].showGridLines = True
-    ws_crew.merge_cells("A1:C1")
-    ws_crew["A1"].value = "👤 STOCK COUNT ACTIVITY BY CREW MEMBER"
-    ws_crew["A1"].font = Font(name="Calibri", size=12, bold=True, color="FFFFFF")
-    ws_crew["A1"].fill = PatternFill(start_color="1E293B", end_color="1E293B", fill_type="solid")
-    ws_crew["A1"].alignment = Alignment(horizontal="center", vertical="center")
-    ws_crew.row_dimensions[1].height = 28
-
-    c_headers = ["Crew Member", "Total SKUs Logged", "Total Quantity Logged"]
-    for idx, h in enumerate(c_headers, 1):
-        c = ws_crew.cell(row=2, column=idx, value=h)
-        c.fill = SUBHEADER_FILL
-        c.font = SUBHEADER_FONT
-        c.alignment = Alignment(horizontal="center", vertical="center")
-        c.border = THIN_BORDER
-
-    crew_dict = {}
-    for item in counts:
-        cr = item.get("crew_name") or "Unknown"
-        if cr not in crew_dict:
-            crew_dict[cr] = {"skus": 0, "qty": 0.0}
-        crew_dict[cr]["skus"] += 1
-        crew_dict[cr]["qty"] += float(item.get("qty", 0))
-
-    c_row = 3
-    for cr_name in sorted(crew_dict.keys(), key=lambda x: crew_dict[x]["qty"], reverse=True):
-        d = crew_dict[cr_name]
-        ws_crew.cell(row=c_row, column=1, value=cr_name).font = BOLD_FONT
-        ws_crew.cell(row=c_row, column=2, value=d["skus"]).alignment = Alignment(horizontal="right")
-        q = ws_crew.cell(row=c_row, column=3, value=d["qty"])
-        q.alignment = Alignment(horizontal="right")
-        q.font = BOLD_FONT
-        for col in range(1, 4):
-            ws_crew.cell(row=c_row, column=col).border = THIN_BORDER
-        c_row += 1
-
-    for worksheet in [ws, ws_shelf, ws_crew]:
-        for col in worksheet.columns:
-            max_len = max((len(str(cell.value or "")) for cell in col if cell.row > 1), default=10)
-            col_letter = get_column_letter(col[0].column)
-            worksheet.column_dimensions[col_letter].width = max(max_len + 4, 12)
-
-    buf = BytesIO()
-    wb.save(buf)
-    buf.seek(0)
-    return buf
-
-
-# ---------------------------------------------------------------------------
-# 7. PARSE 1-SHOT CAPTION
-# ---------------------------------------------------------------------------
-def parse_quick_caption(caption: str, default_shelf: Optional[str] = None, detected_barcode: Optional[str] = None) -> Optional[Tuple[str, str, str, float]]:
+def parse_quick_caption(caption: str, detected_barcode: Optional[str] = None) -> Optional[Tuple[str, str, str, float]]:
     if not caption or not caption.strip():
         return None
     tokens = caption.strip().split()
     if not tokens:
         return None
 
-    shelf = default_shelf or "UNKNOWN"
+    shelf = "UNKNOWN"
     barcode = detected_barcode or "NO_BARCODE"
     item_name = "-"
     qty = 1.0
@@ -636,7 +368,7 @@ def parse_quick_caption(caption: str, default_shelf: Optional[str] = None, detec
 
 
 # ---------------------------------------------------------------------------
-# 8. TELEGRAM HANDLERS
+# 7. TELEGRAM HANDLERS
 # ---------------------------------------------------------------------------
 def get_user_display_name(update: Update) -> str:
     user = update.effective_user
@@ -661,21 +393,14 @@ async def save_tg_photo(file_id: str, context: ContextTypes.DEFAULT_TYPE, prefix
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    active_shelf = await db_get_user_active_shelf(user.id) if user else None
-    shelf_display = f"`{active_shelf}`" if active_shelf else "_Not set_"
-
     msg = (
-        f"👋 *Welcome to Store Stock Count Bot!*\n\n"
-        f"📍 *Your Shelf:* {shelf_display}\n\n"
+        f"👋 *Store Stock Count Bot Active!*\n\n"
         f"👉 *How to count an item:*\n"
-        f"1️⃣ **Just send a photo of the item** 📸\n"
-        f"2️⃣ Bot auto-detects **Name & Barcode** ✨\n"
-        f"3️⃣ Type your **Shelf & Quantity**!\n\n"
-        f"💡 *Commands:*\n"
-        f"• `/export` — 📊 Download Excel Report\n"
-        f"• `/stats` — 📈 View Summary Stats\n"
-        f"• `/shelf <CODE>` — Set default shelf (e.g. `/shelf G101`)"
+        f"1️⃣ **Send a photo of the product front** 📸\n"
+        f"2️⃣ Send barcode photo (or tap Skip)\n"
+        f"3️⃣ Type Shelf (e.g. `G101`)\n"
+        f"4️⃣ Type Quantity (e.g. `12`)\n\n"
+        f"⚡ *Data auto-syncs instantly to Google Sheets!*"
     )
     await update.message.reply_text(
         msg,
@@ -684,68 +409,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-async def cmd_shelf(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    if not user:
-        return
-    if context.args:
-        new_shelf = " ".join(context.args).strip().upper()
-        await db_set_user_active_shelf(user.id, new_shelf)
-        await update.message.reply_text(f"✅ *Active shelf set to:* `{new_shelf}`\nSend a photo to start counting!", parse_mode="Markdown")
-    else:
-        current = await db_get_user_active_shelf(user.id)
-        if current:
-            await update.message.reply_text(f"📍 Current active shelf: `{current}`\nTo change: `/shelf <NEW_SHELF>`", parse_mode="Markdown")
-        else:
-            await update.message.reply_text("📍 No active shelf set. Type: `/shelf <SHELF_CODE>` (e.g. `/shelf G101`)", parse_mode="Markdown")
-
-
-async def cmd_export(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = await update.message.reply_text("⏳ *Generating Excel file...*", parse_mode="Markdown")
-    try:
-        counts = await db_get_all_counts()
-        if not counts:
-            await msg.edit_text("ℹ️ No items recorded yet.")
-            return
-        excel_buf = create_excel_report(counts)
-        filename = f"Stock_Count_{get_current_timestamp().replace(':', '-').replace(' ', '_')}.xlsx"
-        await update.message.reply_document(
-            document=excel_buf,
-            filename=filename,
-            caption=f"📊 *Stock Count Report*\n• Total Items: `{len(counts)}`\n• Time: `{get_current_timestamp()}`",
-            parse_mode="Markdown"
-        )
-        await msg.delete()
-    except Exception as e:
-        logger.error(f"Export error: {e}")
-        await msg.edit_text(f"❌ Error generating Excel: {e}")
-
-
-async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    stats = await db_get_summary_stats()
-    text = (
-        f"📊 *STOCK COUNT SUMMARY*\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"📦 *Total SKUs Counted:* `{stats['total_skus']}`\n"
-        f"🔢 *Total Units (Qty):* `{stats['total_qty']:,.0f}`\n"
-        f"🏢 *Total Shelves:* `{stats['total_shelves']}`\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
-    )
-    if stats["shelf_breakdown"]:
-        text += "🏢 *By Shelf:*\n"
-        for s in stats["shelf_breakdown"][:6]:
-            text += f"• `{s['shelf']}`: {s['sku_count']} SKUs ({s['total_qty']:,.0f} units)\n"
-        text += "\n"
-    if stats["crew_breakdown"]:
-        text += "👤 *By Crew:*\n"
-        for c in stats["crew_breakdown"]:
-            text += f"• {c['crew_name']}: {c['sku_count']} SKUs ({c['total_qty']:,.0f} units)\n"
-
-    await update.message.reply_text(text, parse_mode="Markdown")
-
-
 # ---------------------------------------------------------------------------
-# 9. PHOTO FLOW (Pure Fast Flow: Photo -> Shelf -> Quantity -> Saved)
+# 8. PHOTO FLOW (Photo -> Shelf -> Quantity -> Done!)
 # ---------------------------------------------------------------------------
 async def handle_incoming_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data.clear()
@@ -769,9 +434,8 @@ async def handle_incoming_photo(update: Update, context: ContextTypes.DEFAULT_TY
     else:
         context.user_data["item_name"] = "-"
 
-    active_shelf = await db_get_user_active_shelf(user.id) if user else None
     caption = update.message.caption or ""
-    quick_data = parse_quick_caption(caption, default_shelf=active_shelf, detected_barcode=detected_barcode)
+    quick_data = parse_quick_caption(caption, detected_barcode=detected_barcode)
 
     if quick_data:
         shelf, barcode, name, qty = quick_data
@@ -787,14 +451,11 @@ async def handle_incoming_photo(update: Update, context: ContextTypes.DEFAULT_TY
             qty=qty,
             photo_front=file_path
         )
-        if user and shelf and shelf != "UNKNOWN":
-            await db_set_user_active_shelf(user.id, shelf)
-
         sync_manager.enqueue(record)
         qty_display = int(qty) if qty.is_integer() else qty
 
         await update.message.reply_text(
-            f"⚡ *SAVED! (ID #{record['id']})*\n"
+            f"⚡ *SAVED TO GOOGLE SHEET!*\n"
             f"━━━━━━━━━━━━━━━━━━━━━━\n"
             f"📍 *Shelf:* `{shelf}`\n"
             f"🏷️ *Barcode:* `{barcode}`\n"
@@ -838,38 +499,11 @@ async def flow_skip_barcode_photo_cb(update: Update, context: ContextTypes.DEFAU
 
 
 async def prompt_shelf_step(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    user = update.effective_user
-    active_shelf = await db_get_user_active_shelf(user.id) if user else None
     target = update.callback_query.message if update.callback_query else update.message
-
-    if active_shelf:
-        kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton(f"✅ Keep Current Shelf: {active_shelf}", callback_data=f"shelf_keep_{active_shelf}")]
-        ])
-        await target.reply_text(
-            f"📍 *Please type the Shelf Code* (e.g. `G101`, `A12`, `B05`):\n\n"
-            f"_(Or tap below to keep `{active_shelf}`):_",
-            reply_markup=kb,
-            parse_mode="Markdown"
-        )
-    else:
-        await target.reply_text(
-            "📍 *Please type the Shelf Code* (e.g. `G101`, `A12`, `B05`):",
-            parse_mode="Markdown"
-        )
-    return STATE_SHELF
-
-
-async def flow_shelf_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    query = update.callback_query
-    await query.answer()
-    data = query.data
-
-    if data.startswith("shelf_keep_"):
-        shelf = data.replace("shelf_keep_", "").strip().upper()
-        context.user_data["shelf"] = shelf
-        return await check_barcode_and_prompt_qty(update, context)
-
+    await target.reply_text(
+        "📍 *Please type the Shelf Code* (e.g. `G101`, `A12`, `B05`):",
+        parse_mode="Markdown"
+    )
     return STATE_SHELF
 
 
@@ -879,13 +513,10 @@ async def flow_shelf_text(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await update.message.reply_text("⚠️ Please type the Shelf Code (e.g. `G101`):")
         return STATE_SHELF
     context.user_data["shelf"] = shelf
-    if update.effective_user:
-        await db_set_user_active_shelf(update.effective_user.id, shelf)
     return await check_barcode_and_prompt_qty(update, context)
 
 
 async def check_barcode_and_prompt_qty(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """If barcode was already detected from photo, directly prompt for Quantity!"""
     detected_barcode = context.user_data.get("detected_barcode")
     target = update.callback_query.message if update.callback_query else update.message
 
@@ -898,7 +529,6 @@ async def check_barcode_and_prompt_qty(update: Update, context: ContextTypes.DEF
         )
         return STATE_QTY
 
-    # If barcode was not auto-detected from photo, ask crew to type it
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("⏩ Skip Barcode Number", callback_data="skip_barcode_num")]
     ])
@@ -913,13 +543,10 @@ async def check_barcode_and_prompt_qty(update: Update, context: ContextTypes.DEF
 async def flow_barcode_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
-    data = query.data
-
-    if data == "skip_barcode_num":
+    if query.data == "skip_barcode_num":
         context.user_data["barcode"] = "NO_BARCODE"
         await query.message.reply_text("🔢 *Please type the Quantity (QTY):*\n_(e.g. 1, 5, 12, 24)_", parse_mode="Markdown")
         return STATE_QTY
-
     return STATE_BARCODE
 
 
@@ -970,7 +597,7 @@ async def finalize_and_save_count(update: Update, context: ContextTypes.DEFAULT_
     qty_display = int(qty) if qty.is_integer() else qty
 
     card = (
-        f"✅ *STOCK ITEM SAVED! (ID #{record['id']})*\n"
+        f"✅ *SAVED TO GOOGLE SHEET! (ID #{record['id']})*\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
         f"📍 *Shelf:* `{shelf}`\n"
         f"🏷️ *Barcode:* `{barcode}`\n"
@@ -979,7 +606,7 @@ async def finalize_and_save_count(update: Update, context: ContextTypes.DEFAULT_
         f"👤 *Crew:* {crew_name}\n"
         f"🕒 *Time:* `{record['timestamp']}`\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"👉 *Send next photo to keep counting on Shelf `{shelf}`!*"
+        f"👉 *Send next photo to continue!*"
     )
     await target.reply_text(card, parse_mode="Markdown")
     context.user_data.clear()
@@ -993,7 +620,7 @@ async def flow_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
 
 
 # ---------------------------------------------------------------------------
-# 10. LIGHTWEIGHT HTTP HEALTH SERVER
+# 9. LIGHTWEIGHT HTTP HEALTH SERVER
 # ---------------------------------------------------------------------------
 async def handle_health_check(request):
     if not TELEGRAM_BOT_TOKEN:
@@ -1010,7 +637,7 @@ async def handle_health_check(request):
 
 
 # ---------------------------------------------------------------------------
-# 11. MAIN RUNNER
+# 10. MAIN RUNNER
 # ---------------------------------------------------------------------------
 async def main_async():
     logger.info("Initializing SQLite database...")
@@ -1046,7 +673,6 @@ async def main_async():
                 CommandHandler("cancel", flow_cancel)
             ],
             STATE_SHELF: [
-                CallbackQueryHandler(flow_shelf_callback, pattern="^shelf_keep_"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, flow_shelf_text),
                 CommandHandler("cancel", flow_cancel)
             ],
@@ -1068,9 +694,6 @@ async def main_async():
     tg_app.add_handler(conv)
     tg_app.add_handler(CommandHandler("start", cmd_start))
     tg_app.add_handler(CommandHandler("help", cmd_start))
-    tg_app.add_handler(CommandHandler("shelf", cmd_shelf))
-    tg_app.add_handler(CommandHandler("export", cmd_export))
-    tg_app.add_handler(CommandHandler("stats", cmd_stats))
 
     await tg_app.initialize()
     await tg_app.start()
