@@ -1,12 +1,12 @@
 """
 =============================================================================
-STORE STOCK SCAN BOT — MINIMAL & ULTRA FAST EDITION
+STORE STOCK SCAN BOT — MINIMAL & ULTRA FAST EDITION (RESILIENT)
 =============================================================================
 - Pure 3-Step Flow: Photo -> Shelf -> Quantity -> Real-time Google Sheet!
-- 100% Automated Product Name (Gemini AI Vision)
+- 100% Automated Product Name (Gemini AI Vision with optimized image compression)
 - 100% Automated Barcode Detection (zxing-cpp)
 - Real-time Instant Sync to Google Sheets
-- 0 Clutter: No extra buttons, no unnecessary commands
+- Auto-fallback for environment variable spellings (TELEGRAM / TELEGRAN)
 =============================================================================
 """
 
@@ -17,6 +17,7 @@ import base64
 import asyncio
 import logging
 import zoneinfo
+from io import BytesIO
 from datetime import datetime
 from pathlib import Path
 from contextlib import asynccontextmanager
@@ -52,14 +53,32 @@ from telegram.ext import (
 )
 
 # ---------------------------------------------------------------------------
-# 1. CONFIGURATION
+# 1. CONFIGURATION (Resilient Env Var Matching)
 # ---------------------------------------------------------------------------
 BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / ".env")
 
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-GOOGLE_SHEET_WEBHOOK_URL = os.getenv("GOOGLE_SHEET_WEBHOOK_URL", "").strip()
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+# Accept both TELEGRAM_BOT_TOKEN and TELEGRAN_BOT_TOKEN (common typo)
+TELEGRAM_BOT_TOKEN = (
+    os.getenv("TELEGRAM_BOT_TOKEN", "")
+    or os.getenv("TELEGRAN_BOT_TOKEN", "")
+    or os.getenv("BOT_TOKEN", "")
+).strip()
+
+# Accept both GOOGLE_SHEET_WEBHOOK_URL and variants
+GOOGLE_SHEET_WEBHOOK_URL = (
+    os.getenv("GOOGLE_SHEET_WEBHOOK_URL", "")
+    or os.getenv("GOOGLE_SHEETS_WEBHOOK_URL", "")
+    or os.getenv("SHEET_WEBHOOK_URL", "")
+).strip()
+
+# Accept GEMINI_API_KEY and GOOGLE_API_KEY
+GEMINI_API_KEY = (
+    os.getenv("GEMINI_API_KEY", "")
+    or os.getenv("GOOGLE_API_KEY", "")
+    or os.getenv("GEMINI_KEY", "")
+).strip()
+
 DATABASE_PATH = os.getenv("DATABASE_PATH", str(BASE_DIR / "inventory.db"))
 PHOTOS_DIR = Path(os.getenv("PHOTOS_DIR", str(BASE_DIR / "photos")))
 PHOTOS_DIR.mkdir(parents=True, exist_ok=True)
@@ -166,39 +185,62 @@ async def db_mark_synced(count_ids: list):
 # ---------------------------------------------------------------------------
 # 3. AI VISION PRODUCT NAME EXTRACTOR (Auto-Catch from Packaging)
 # ---------------------------------------------------------------------------
+def compress_image_for_ai(image_path: str) -> Optional[str]:
+    """Compresses image to max 800px width/height to make AI Vision ultra-fast (<0.5s)."""
+    try:
+        with Image.open(image_path) as img:
+            img = ImageOps.exif_transpose(img) or img
+            img.thumbnail((800, 800), Image.Resampling.LANCZOS)
+            if img.mode != "RGB":
+                img = img.convert("RGB")
+            buf = BytesIO()
+            img.save(buf, format="JPEG", quality=80)
+            return base64.b64encode(buf.getvalue()).decode("utf-8")
+    except Exception as e:
+        logger.warning(f"Image compression error: {e}")
+        return None
+
+
 async def extract_product_name_from_image(image_path: str) -> Optional[str]:
     if not image_path or not os.path.exists(image_path):
         return None
 
-    api_key = os.getenv("GEMINI_API_KEY", "").strip()
+    api_key = GEMINI_API_KEY
     if not api_key:
+        logger.warning("⚠️ GEMINI_API_KEY is not configured.")
         return None
 
-    try:
-        with open(image_path, "rb") as f:
-            img_b64 = base64.b64encode(f.read()).decode("utf-8")
+    img_b64 = await asyncio.to_thread(compress_image_for_ai, image_path)
+    if not img_b64:
+        return None
 
-        prompt = (
-            "Look at this product packaging image. Extract ONLY the Brand and Product Name "
-            "(including flavor or size if clearly visible). Output concise name in max 5 words. "
-            "Do NOT include markdown, quotes, bullet points, or extra text. "
-            "Example: 'Jardo Seaweed Rice Chip' or 'Lay's Classic 50g' or 'Coca Cola 325ml'."
-        )
+    prompt = (
+        "Look at this product packaging image. Extract and return ONLY the Brand Name and Product Name "
+        "(including flavor or size if clearly visible). Output maximum 5 words. "
+        "Do NOT include markdown, quotes, bullet points, or any other words. "
+        "Example output: 'Jardo Seaweed Rice Chip' or 'Lay's Classic 50g' or 'Coca Cola 325ml'."
+    )
 
-        models = ["gemini-1.5-flash", "gemini-2.0-flash", "gemini-2.5-flash"]
-        for model in models:
-            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
-            payload = {
-                "contents": [{
-                    "parts": [
-                        {"text": prompt},
-                        {"inlineData": {"mimeType": "image/jpeg", "data": img_b64}}
-                    ]
-                }]
-            }
+    models = ["gemini-1.5-flash", "gemini-2.0-flash", "gemini-2.5-flash", "gemini-1.5-pro"]
+    for model in models:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
+        payload = {
+            "contents": [{
+                "parts": [
+                    {"text": prompt},
+                    {
+                        "inline_data": {
+                            "mime_type": "image/jpeg",
+                            "data": img_b64
+                        }
+                    }
+                ]
+            }]
+        }
 
+        try:
             async with aiohttp.ClientSession() as session:
-                async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=8)) as resp:
+                async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=10)) as resp:
                     if resp.status == 200:
                         data = await resp.json()
                         candidates = data.get("candidates", [])
@@ -206,12 +248,15 @@ async def extract_product_name_from_image(image_path: str) -> Optional[str]:
                             text = candidates[0].get("content", {}).get("parts", [{}])[0].get("text", "")
                             clean_name = text.strip().replace("\n", " ").replace("*", "").replace('"', '').strip()
                             if clean_name and len(clean_name) > 2:
-                                logger.info(f"✨ AI extracted product name: {clean_name}")
+                                logger.info(f"✨ AI Vision extracted product name: '{clean_name}'")
                                 return clean_name
                     elif resp.status == 404:
                         continue
-    except Exception as e:
-        logger.warning(f"Error extracting product name with AI: {e}")
+                    else:
+                        err_text = await resp.text()
+                        logger.warning(f"Gemini Vision API ({model}) returned {resp.status}: {err_text}")
+        except Exception as e:
+            logger.warning(f"Error calling Gemini Vision API ({model}): {e}")
 
     return None
 
