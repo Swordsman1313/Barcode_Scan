@@ -1,13 +1,11 @@
 """
 =============================================================================
-STORE STOCK SCAN BOT — DUAL-ENGINE AUTO PRODUCT NAMER
+STORE STOCK SCAN BOT — AI PACKAGING READER & DUAL PHOTO GOOGLE SHEETS
 =============================================================================
-- Engine 1: Gemini AI Vision (Reads Brand & Flavor directly from packaging photo)
-- Engine 2: Global Barcode Database (Instant online product lookup by Barcode)
-- Catches BOTH Front Packaging Photo & Barcode Photo for Google Sheets
-- Clickable Full HD images in Google Sheets
-- Auto Barcode Scanner (zxing-cpp)
-- Real-time Instant Sync to Google Sheets
+- AI Vision: Automatically reads text & brand directly from product packaging
+- Dual HD Photos: Pushes both Front Photo & Barcode Photo to Google Sheets
+- Real-time Diagnostic Feedback (Shows detected name or key status immediately)
+- Zero master product data needed (100% photo-based visual AI)
 =============================================================================
 """
 
@@ -200,7 +198,7 @@ async def db_mark_synced(count_ids: list):
 
 
 # ---------------------------------------------------------------------------
-# 3. AUTO-NAMER ENGINE 1: GEMINI AI VISION (Reads packaging photo)
+# 3. AI VISION: READS BRAND & PACKAGING DIRECTLY FROM PHOTO
 # ---------------------------------------------------------------------------
 def compress_image_for_ai(image_path: str) -> Optional[str]:
     try:
@@ -217,21 +215,27 @@ def compress_image_for_ai(image_path: str) -> Optional[str]:
         return None
 
 
-async def extract_product_name_from_image(image_path: str) -> Optional[str]:
+async def extract_product_name_from_image(image_path: str) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Calls Google Gemini Vision to read text from product packaging.
+    Returns: (detected_name, status_message)
+    """
     if not image_path or not os.path.exists(image_path):
-        return None
+        return None, "File not found"
 
     api_key = GEMINI_API_KEY
     if not api_key:
-        return None
+        logger.warning("⚠️ GEMINI_API_KEY is not set in Environment Variables.")
+        return None, "⚠️ GEMINI_API_KEY missing in Render"
 
     img_b64 = await asyncio.to_thread(compress_image_for_ai, image_path)
     if not img_b64:
-        return None
+        return None, "Image compression failed"
 
     prompt = (
-        "Identify and extract ONLY the Brand Name and Product Name (with flavor or size if visible). "
-        "Return concise name in maximum 5 words. Do NOT include markdown, quotes, bullet points, or filler words. "
+        "Look at this product packaging image. Read the main product name and brand printed on the front. "
+        "Return ONLY the concise Brand and Product Name (including flavor or size if visible, maximum 5 words). "
+        "Do NOT include markdown, asterisks, bullet points, quotes, or filler. "
         "Example output: 'Jardo Seaweed Rice Chip' or 'Lay's Classic 50g' or 'Coca Cola 325ml'."
     )
 
@@ -243,6 +247,7 @@ async def extract_product_name_from_image(image_path: str) -> Optional[str]:
         "gemini-1.5-pro"
     ]
     
+    last_error = ""
     for model in models:
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
         headers = {"Content-Type": "application/json"}
@@ -270,40 +275,21 @@ async def extract_product_name_from_image(image_path: str) -> Optional[str]:
                             text = candidates[0].get("content", {}).get("parts", [{}])[0].get("text", "")
                             clean_name = text.strip().replace("\n", " ").replace("*", "").replace('"', '').strip()
                             if clean_name and len(clean_name) > 2:
-                                logger.info(f"✨ Gemini AI Vision ({model}) extracted name: '{clean_name}'")
-                                return clean_name
+                                logger.info(f"✨ AI Vision ({model}) read name from packaging: '{clean_name}'")
+                                return clean_name, "OK"
+                    else:
+                        last_error = f"API Status {resp.status}"
+                        err_text = await resp.text()
+                        logger.warning(f"Gemini Vision API ({model}) returned {resp.status}: {err_text}")
         except Exception as e:
-            logger.debug(f"Gemini API ({model}) check error: {e}")
+            last_error = str(e)
+            logger.debug(f"Gemini API ({model}) exception: {e}")
 
-    return None
-
-
-# ---------------------------------------------------------------------------
-# 4. AUTO-NAMER ENGINE 2: GLOBAL BARCODE DATABASE LOOKUP (OpenFoodFacts)
-# ---------------------------------------------------------------------------
-async def lookup_barcode_online(barcode: str) -> Optional[str]:
-    if not barcode or barcode == "NO_BARCODE" or len(barcode) < 6:
-        return None
-    try:
-        url = f"https://world.openfoodfacts.org/api/v0/product/{barcode}.json"
-        headers = {"User-Agent": "StockBot/2.0 (retail stock count bot)"}
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=4)) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    if data.get("status") == 1:
-                        product = data.get("product", {})
-                        name = product.get("product_name") or product.get("product_name_en") or product.get("generic_name")
-                        if name and len(name.strip()) > 1:
-                            logger.info(f"✨ Online Barcode Database found name: '{name.strip()}'")
-                            return name.strip()
-    except Exception as e:
-        logger.debug(f"Online barcode lookup error: {e}")
-    return None
+    return None, last_error or "AI could not recognize name"
 
 
 # ---------------------------------------------------------------------------
-# 5. BARCODE RECOGNITION (zxing-cpp + PIL)
+# 4. BARCODE RECOGNITION (zxing-cpp + PIL)
 # ---------------------------------------------------------------------------
 def detect_barcode_from_image(image_path: str) -> Optional[str]:
     if not HAS_ZXING or not image_path or not os.path.exists(image_path):
@@ -337,7 +323,7 @@ def detect_barcode_from_image(image_path: str) -> Optional[str]:
 
 
 # ---------------------------------------------------------------------------
-# 6. GOOGLE SHEETS ASYNC BACKGROUND SYNC (Dual Photos: Front + Barcode)
+# 5. GOOGLE SHEETS ASYNC BACKGROUND SYNC (Dual Photos: Front + Barcode)
 # ---------------------------------------------------------------------------
 class SheetsSyncManager:
     def __init__(self, webhook_url: Optional[str] = None):
@@ -414,7 +400,7 @@ sync_manager = SheetsSyncManager()
 
 
 # ---------------------------------------------------------------------------
-# 7. FAST 1-SHOT CAPTION
+# 6. FAST 1-SHOT CAPTION
 # ---------------------------------------------------------------------------
 def parse_quick_caption(caption: str, detected_barcode: Optional[str] = None) -> Optional[Tuple[str, str, str, float]]:
     if not caption or not caption.strip():
@@ -458,7 +444,7 @@ def parse_quick_caption(caption: str, detected_barcode: Optional[str] = None) ->
 
 
 # ---------------------------------------------------------------------------
-# 8. TELEGRAM HANDLERS
+# 7. TELEGRAM HANDLERS
 # ---------------------------------------------------------------------------
 def get_user_display_name(update: Update) -> str:
     user = update.effective_user
@@ -499,7 +485,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"2️⃣ Send barcode photo (or tap Skip)\n"
         f"3️⃣ Type Shelf (e.g. `G101`)\n"
         f"4️⃣ Type Quantity (e.g. `12`)\n\n"
-        f"⚡ *Auto-extracts product name & syncs live to Google Sheets!*"
+        f"⚡ *Auto-reads product name from packaging & syncs live to Google Sheets!*"
     )
     await update.message.reply_text(
         msg,
@@ -509,7 +495,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ---------------------------------------------------------------------------
-# 9. PHOTO FLOW (Front Photo -> Barcode Photo -> Shelf -> Quantity -> Saved)
+# 8. PHOTO FLOW (Front Photo -> Barcode Photo -> Shelf -> Quantity -> Saved)
 # ---------------------------------------------------------------------------
 async def handle_incoming_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data.clear()
@@ -522,28 +508,23 @@ async def handle_incoming_photo(update: Update, context: ContextTypes.DEFAULT_TY
     context.user_data["photo_front_url"] = photo_front_url
 
     # Concurrently detect barcode and extract product name from packaging via AI
-    detected_barcode, ai_name = await asyncio.gather(
+    detected_barcode, (ai_name, ai_status) = await asyncio.gather(
         asyncio.to_thread(detect_barcode_from_image, file_path),
         extract_product_name_from_image(file_path)
     )
 
-    detected_name = ai_name
-    if not detected_name and detected_barcode:
-        detected_name = await lookup_barcode_online(detected_barcode)
+    detected_name = ai_name or "-"
+    context.user_data["item_name"] = detected_name
 
     if detected_barcode:
         context.user_data["detected_barcode"] = detected_barcode
-    if detected_name:
-        context.user_data["item_name"] = detected_name
-    else:
-        context.user_data["item_name"] = "-"
 
     caption = update.message.caption or ""
     quick_data = parse_quick_caption(caption, detected_barcode=detected_barcode)
 
     if quick_data:
         shelf, barcode, name, qty = quick_data
-        if name == "-" and detected_name:
+        if name == "-" and detected_name != "-":
             name = detected_name
 
         record = await db_insert_count(
@@ -573,11 +554,16 @@ async def handle_incoming_photo(update: Update, context: ContextTypes.DEFAULT_TY
         )
         return ConversationHandler.END
 
-    name_status = f"\n📦 *Item:* `{detected_name}` (Auto-detected ✨)" if detected_name else ""
+    if detected_name != "-":
+        name_status = f"\n📦 *Item:* `{detected_name}` (Auto-detected from packaging ✨)"
+    elif "missing" in ai_status.lower():
+        name_status = f"\n⚠️ *Note:* `GEMINI_API_KEY` is not set on Render."
+    else:
+        name_status = ""
 
     kb = InlineKeyboardMarkup([[InlineKeyboardButton("⏩ Skip (Barcode is in this photo)", callback_data="skip_barcode_photo")]])
     await update.message.reply_text(
-        f"📸 *Photo 1 Received (Product Front)!*{name_status}\n\n"
+        f"📸 *Photo 1 Received (Packaging Front)!*{name_status}\n\n"
         f"📷 Now send **Photo 2 (Barcode label)** (or tap Skip below):",
         reply_markup=kb,
         parse_mode="Markdown"
@@ -595,11 +581,6 @@ async def flow_receive_barcode_photo(update: Update, context: ContextTypes.DEFAU
         detected = detect_barcode_from_image(file_path)
         if detected:
             context.user_data["detected_barcode"] = detected
-            # If name not detected yet, check online barcode database
-            if context.user_data.get("item_name") in (None, "-"):
-                db_name = await lookup_barcode_online(detected)
-                if db_name:
-                    context.user_data["item_name"] = db_name
             
     return await prompt_shelf_step(update, context)
 
@@ -636,12 +617,6 @@ async def check_barcode_and_prompt_qty(update: Update, context: ContextTypes.DEF
 
     if detected_barcode:
         context.user_data["barcode"] = detected_barcode
-        # Also check online DB if name still empty
-        if context.user_data.get("item_name") in (None, "-"):
-            db_name = await lookup_barcode_online(detected_barcode)
-            if db_name:
-                context.user_data["item_name"] = db_name
-
         await target.reply_text(
             f"🏷️ *Barcode:* `{detected_barcode}` (Auto-detected ✨)\n\n"
             f"🔢 *Please type the Quantity (QTY):*\n_(e.g. 1, 5, 12, 24)_",
@@ -673,11 +648,6 @@ async def flow_barcode_callback(update: Update, context: ContextTypes.DEFAULT_TY
 async def flow_barcode_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     barcode = update.message.text.strip()
     context.user_data["barcode"] = barcode or "NO_BARCODE"
-    if context.user_data.get("item_name") in (None, "-") and barcode.isdigit():
-        db_name = await lookup_barcode_online(barcode)
-        if db_name:
-            context.user_data["item_name"] = db_name
-            
     await update.message.reply_text("🔢 *Please type the Quantity (QTY):*\n_(e.g. 1, 5, 12, 24)_", parse_mode="Markdown")
     return STATE_QTY
 
@@ -749,7 +719,7 @@ async def flow_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
 
 
 # ---------------------------------------------------------------------------
-# 10. LIGHTWEIGHT HTTP HEALTH SERVER
+# 9. LIGHTWEIGHT HTTP HEALTH SERVER
 # ---------------------------------------------------------------------------
 async def handle_health_check(request):
     if not TELEGRAM_BOT_TOKEN:
@@ -766,7 +736,7 @@ async def handle_health_check(request):
 
 
 # ---------------------------------------------------------------------------
-# 11. MAIN RUNNER
+# 10. MAIN RUNNER
 # ---------------------------------------------------------------------------
 async def main_async():
     logger.info("Initializing SQLite database...")
