@@ -1,85 +1,41 @@
-/**
- * Google Apps Script for Real-Time Stock Count Auto-Fill
- * =======================================================
- * HOW TO SETUP (Takes 1 minute):
- * 1. Open your Google Sheet.
- * 2. Click on "Extensions" -> "Apps Script".
- * 3. Delete any default code and PASTE THIS ENTIRE SCRIPT.
- * 4. Click "Deploy" (top right) -> "New deployment".
- * 5. Select type: "Web app".
- * 6. Under "Who has access", select: "Anyone". (CRITICAL)
- * 7. Click "Deploy", authorize permissions if prompted, and COPY the "Web App URL".
- * 8. Paste the URL into your bot's .env file:
- *    GOOGLE_SHEET_WEBHOOK_URL="https://script.google.com/macros/s/xxxxxx/exec"
- */
-
 function doPost(e) {
   try {
     var sheet = SpreadsheetApp.getActiveSpreadsheet().getActiveSheet();
     
-    // Ensure header row exists on first use
+    // Auto-create headers on row 1 if sheet is empty
     if (sheet.getLastRow() === 0) {
-      setupHeaders(sheet);
+      sheet.appendRow(["Date & Time", "Crew Member", "Shelf Location", "Barcode Number", "Item Name", "Quantity", "Product Photo"]);
+      var headerRange = sheet.getRange(1, 1, 1, 7);
+      headerRange.setFontWeight("bold");
+      headerRange.setBackground("#1E3A8A");
+      headerRange.setFontColor("#FFFFFF");
+      headerRange.setHorizontalAlignment("center");
+      sheet.setFrozenRows(1);
+      sheet.setColumnWidth(7, 100);
     }
     
-    // Parse incoming JSON payload from Telegram Bot
     var data = JSON.parse(e.postData.contents);
-    
     var timestamp = data.timestamp || Utilities.formatDate(new Date(), "Asia/Bangkok", "yyyy-MM-dd HH:mm:ss");
     var crew = data.crew || "Unknown";
-    var shelf = (data.shelf || "").toUpperCase();
-    var barcode = "'" + String(data.barcode || ""); // Prefix with ' to guarantee text format
+    var shelf = String(data.shelf || "").toUpperCase();
+    var barcode = "'" + String(data.barcode || ""); // Prefix with ' to keep barcode as text
     var itemName = data.name || "-";
     var qty = Number(data.qty) || 1;
+    var photoUrl = data.photo_url || "";
     
-    // Append the row
-    sheet.appendRow([
-      timestamp,
-      crew,
-      shelf,
-      barcode,
-      itemName,
-      qty
-    ]);
+    var imageFormula = photoUrl ? '=IMAGE("' + photoUrl + '", 1)' : "";
+    sheet.appendRow([timestamp, crew, shelf, barcode, itemName, qty, imageFormula]);
     
-    // Format the barcode cell explicitly as text
     var lastRow = sheet.getLastRow();
-    sheet.getRange(lastRow, 4).setNumberFormat("@");
-    sheet.getRange(lastRow, 6).setNumberFormat("#,##0");
+    sheet.getRange(lastRow, 4).setNumberFormat("@"); // Format barcode as text
+    sheet.getRange(lastRow, 6).setNumberFormat("#,##0"); // Format quantity
+    sheet.getRange(lastRow, 1, 1, 7).setVerticalAlignment("middle");
+    if (photoUrl) {
+      sheet.setRowHeight(lastRow, 65); // Give height so image is clear
+    }
     
-    return ContentService.createTextOutput(JSON.stringify({
-      status: "success",
-      message: "Row appended successfully",
-      row: lastRow
-    })).setMimeType(ContentService.MimeType.JSON);
-    
+    return ContentService.createTextOutput("OK");
   } catch (err) {
-    return ContentService.createTextOutput(JSON.stringify({
-      status: "error",
-      message: err.toString()
-    })).setMimeType(ContentService.MimeType.JSON);
+    return ContentService.createTextOutput("Error: " + err.toString());
   }
-}
-
-function setupHeaders(sheet) {
-  var headers = [
-    "Date & Time",
-    "Crew Member",
-    "Shelf Location",
-    "Barcode Number",
-    "Item Name / Description",
-    "Quantity"
-  ];
-  
-  sheet.appendRow(headers);
-  var headerRange = sheet.getRange(1, 1, 1, headers.length);
-  headerRange.setFontWeight("bold");
-  headerRange.setBackground("#1E3A8A");
-  headerRange.setFontColor("#FFFFFF");
-  headerRange.setHorizontalAlignment("center");
-  sheet.setFrozenRows(1);
-}
-
-function doGet(e) {
-  return ContentService.createTextOutput("Stock Count Webhook is online and active!").setMimeType(ContentService.MimeType.TEXT);
 }

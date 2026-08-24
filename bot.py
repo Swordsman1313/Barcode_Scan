@@ -1,12 +1,11 @@
 """
 =============================================================================
-STORE STOCK SCAN BOT — MINIMAL & ULTRA FAST EDITION (RESILIENT)
+STORE STOCK SCAN BOT — AI VISION PACKAGING + PHOTO PUSH TO GOOGLE SHEETS
 =============================================================================
-- Pure 3-Step Flow: Photo -> Shelf -> Quantity -> Real-time Google Sheet!
-- 100% Automated Product Name (Gemini AI Vision with optimized image compression)
-- 100% Automated Barcode Detection (zxing-cpp)
-- Real-time Instant Sync to Google Sheets
-- Auto-fallback for environment variable spellings (TELEGRAM / TELEGRAN)
+- AI Vision Product Name (Gemini REST API with camelCase inlineData & mimeType)
+- Direct Product Photo Push into Google Sheets (=IMAGE)
+- Auto Barcode Scanner (zxing-cpp)
+- Instant 3-Step Flow: Photo -> Shelf -> QTY -> Synced
 =============================================================================
 """
 
@@ -53,26 +52,23 @@ from telegram.ext import (
 )
 
 # ---------------------------------------------------------------------------
-# 1. CONFIGURATION (Resilient Env Var Matching)
+# 1. CONFIGURATION
 # ---------------------------------------------------------------------------
 BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / ".env")
 
-# Accept both TELEGRAM_BOT_TOKEN and TELEGRAN_BOT_TOKEN (common typo)
 TELEGRAM_BOT_TOKEN = (
     os.getenv("TELEGRAM_BOT_TOKEN", "")
     or os.getenv("TELEGRAN_BOT_TOKEN", "")
     or os.getenv("BOT_TOKEN", "")
 ).strip()
 
-# Accept both GOOGLE_SHEET_WEBHOOK_URL and variants
 GOOGLE_SHEET_WEBHOOK_URL = (
     os.getenv("GOOGLE_SHEET_WEBHOOK_URL", "")
     or os.getenv("GOOGLE_SHEETS_WEBHOOK_URL", "")
     or os.getenv("SHEET_WEBHOOK_URL", "")
 ).strip()
 
-# Accept GEMINI_API_KEY and GOOGLE_API_KEY
 GEMINI_API_KEY = (
     os.getenv("GEMINI_API_KEY", "")
     or os.getenv("GOOGLE_API_KEY", "")
@@ -96,7 +92,7 @@ STATE_BARCODE_PHOTO, STATE_SHELF, STATE_BARCODE, STATE_QTY = range(4)
 
 
 # ---------------------------------------------------------------------------
-# 2. DATABASE LAYER (SQLite WAL Mode)
+# 2. DATABASE LAYER
 # ---------------------------------------------------------------------------
 def get_current_timestamp() -> str:
     try:
@@ -133,6 +129,7 @@ async def init_db():
                 qty REAL NOT NULL DEFAULT 1,
                 photo_front TEXT,
                 photo_barcode TEXT,
+                photo_url TEXT,
                 synced_sheet INTEGER NOT NULL DEFAULT 0
             );
         """)
@@ -140,7 +137,7 @@ async def init_db():
         await db.commit()
 
 
-async def db_insert_count(user_id: int, crew_name: str, shelf: str, barcode: str, item_name: str, qty: float, photo_front: str = None, photo_barcode: str = None) -> Dict[str, Any]:
+async def db_insert_count(user_id: int, crew_name: str, shelf: str, barcode: str, item_name: str, qty: float, photo_front: str = None, photo_barcode: str = None, photo_url: str = None) -> Dict[str, Any]:
     timestamp = get_current_timestamp()
     shelf_clean = (shelf or "UNKNOWN").strip().upper()
     barcode_clean = str(barcode or "NO_BARCODE").strip()
@@ -150,10 +147,10 @@ async def db_insert_count(user_id: int, crew_name: str, shelf: str, barcode: str
         cursor = await db.execute(
             """
             INSERT INTO counts (
-                timestamp, user_id, crew_name, shelf, barcode, item_name, qty, photo_front, photo_barcode, synced_sheet
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
+                timestamp, user_id, crew_name, shelf, barcode, item_name, qty, photo_front, photo_barcode, photo_url, synced_sheet
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
             """,
-            (timestamp, user_id, crew_name, shelf_clean, barcode_clean, item_name_clean, qty, photo_front, photo_barcode)
+            (timestamp, user_id, crew_name, shelf_clean, barcode_clean, item_name_clean, qty, photo_front, photo_barcode, photo_url)
         )
         row_id = cursor.lastrowid
         await db.commit()
@@ -169,6 +166,7 @@ async def db_insert_count(user_id: int, crew_name: str, shelf: str, barcode: str
         "qty": qty,
         "photo_front": photo_front,
         "photo_barcode": photo_barcode,
+        "photo_url": photo_url,
         "synced_sheet": 0
     }
 
@@ -183,14 +181,13 @@ async def db_mark_synced(count_ids: list):
 
 
 # ---------------------------------------------------------------------------
-# 3. AI VISION PRODUCT NAME EXTRACTOR (Auto-Catch from Packaging)
+# 3. AI VISION PRODUCT NAME EXTRACTOR (Fixed CamelCase REST Spec)
 # ---------------------------------------------------------------------------
 def compress_image_for_ai(image_path: str) -> Optional[str]:
-    """Compresses image to max 800px width/height to make AI Vision ultra-fast (<0.5s)."""
     try:
         with Image.open(image_path) as img:
             img = ImageOps.exif_transpose(img) or img
-            img.thumbnail((800, 800), Image.Resampling.LANCZOS)
+            img.thumbnail((768, 768), Image.Resampling.LANCZOS)
             if img.mode != "RGB":
                 img = img.convert("RGB")
             buf = BytesIO()
@@ -207,7 +204,7 @@ async def extract_product_name_from_image(image_path: str) -> Optional[str]:
 
     api_key = GEMINI_API_KEY
     if not api_key:
-        logger.warning("⚠️ GEMINI_API_KEY is not configured.")
+        logger.info("ℹ️ GEMINI_API_KEY is not set.")
         return None
 
     img_b64 = await asyncio.to_thread(compress_image_for_ai, image_path)
@@ -215,10 +212,9 @@ async def extract_product_name_from_image(image_path: str) -> Optional[str]:
         return None
 
     prompt = (
-        "Look at this product packaging image. Extract and return ONLY the Brand Name and Product Name "
-        "(including flavor or size if clearly visible). Output maximum 5 words. "
-        "Do NOT include markdown, quotes, bullet points, or any other words. "
-        "Example output: 'Jardo Seaweed Rice Chip' or 'Lay's Classic 50g' or 'Coca Cola 325ml'."
+        "Identify and extract ONLY the Brand Name and Product Name (with flavor or size if visible). "
+        "Return concise name in maximum 5 words. Do NOT include markdown, punctuation, or filler. "
+        "Example: 'Jardo Seaweed Rice Chip' or 'Lay's Classic 50g'."
     )
 
     models = ["gemini-1.5-flash", "gemini-2.0-flash", "gemini-2.5-flash", "gemini-1.5-pro"]
@@ -229,8 +225,8 @@ async def extract_product_name_from_image(image_path: str) -> Optional[str]:
                 "parts": [
                     {"text": prompt},
                     {
-                        "inline_data": {
-                            "mime_type": "image/jpeg",
+                        "inlineData": {
+                            "mimeType": "image/jpeg",
                             "data": img_b64
                         }
                     }
@@ -240,7 +236,7 @@ async def extract_product_name_from_image(image_path: str) -> Optional[str]:
 
         try:
             async with aiohttp.ClientSession() as session:
-                async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                async with session.post(url, json=payload, headers={"Content-Type": "application/json"}, timeout=aiohttp.ClientTimeout(total=10)) as resp:
                     if resp.status == 200:
                         data = await resp.json()
                         candidates = data.get("candidates", [])
@@ -254,9 +250,9 @@ async def extract_product_name_from_image(image_path: str) -> Optional[str]:
                         continue
                     else:
                         err_text = await resp.text()
-                        logger.warning(f"Gemini Vision API ({model}) returned {resp.status}: {err_text}")
+                        logger.warning(f"Gemini API ({model}) status {resp.status}: {err_text}")
         except Exception as e:
-            logger.warning(f"Error calling Gemini Vision API ({model}): {e}")
+            logger.warning(f"Error calling Gemini API ({model}): {e}")
 
     return None
 
@@ -296,7 +292,7 @@ def detect_barcode_from_image(image_path: str) -> Optional[str]:
 
 
 # ---------------------------------------------------------------------------
-# 5. GOOGLE SHEETS ASYNC BACKGROUND SYNC
+# 5. GOOGLE SHEETS ASYNC BACKGROUND SYNC (With Photo URL Support)
 # ---------------------------------------------------------------------------
 class SheetsSyncManager:
     def __init__(self, webhook_url: Optional[str] = None):
@@ -310,7 +306,7 @@ class SheetsSyncManager:
         if self._is_running:
             return
         self._is_running = True
-        self._session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10))
+        self._session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=12))
         self._worker_task = asyncio.create_task(self._process_queue())
 
     async def stop(self):
@@ -338,14 +334,17 @@ class SheetsSyncManager:
             "shelf": data.get("shelf", ""),
             "barcode": str(data.get("barcode", "")),
             "name": data.get("item_name", ""),
-            "qty": data.get("qty", 1)
+            "qty": data.get("qty", 1),
+            "photo_url": data.get("photo_url", "")
         }
         for attempt in range(1, 4):
             try:
                 async with self._session.post(self.webhook_url, json=payload) as resp:
                     if resp.status in (200, 201, 302):
+                        logger.info(f"✅ Google Sheet synced row: {payload['barcode']} ({payload['name']})")
                         return True
-            except Exception:
+            except Exception as e:
+                logger.warning(f"Google Sheet sync attempt {attempt} failed: {e}")
                 if attempt < 3:
                     await asyncio.sleep(2 ** attempt)
         return False
@@ -425,16 +424,19 @@ def get_user_display_name(update: Update) -> str:
     return full_name or f"User_{user.id}"
 
 
-async def save_tg_photo(file_id: str, context: ContextTypes.DEFAULT_TYPE, prefix: str = "img") -> str:
+async def save_tg_photo(file_id: str, context: ContextTypes.DEFAULT_TYPE, prefix: str = "img") -> Tuple[str, str]:
     try:
         tg_file = await context.bot.get_file(file_id)
         filename = f"{prefix}_{uuid.uuid4().hex[:8]}.jpg"
         file_path = str(PHOTOS_DIR / filename)
         await tg_file.download_to_drive(custom_path=file_path)
-        return file_path
+        
+        # Build direct telegram photo link if file_path available
+        photo_url = f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}/{tg_file.file_path}" if tg_file.file_path else ""
+        return file_path, photo_url
     except Exception as e:
         logger.error(f"Error saving photo: {e}")
-        return ""
+        return "", ""
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -463,8 +465,9 @@ async def handle_incoming_photo(update: Update, context: ContextTypes.DEFAULT_TY
     crew_name = get_user_display_name(update)
 
     photo = update.message.photo[-1]
-    file_path = await save_tg_photo(photo.file_id, context, prefix="front")
+    file_path, photo_url = await save_tg_photo(photo.file_id, context, prefix="front")
     context.user_data["photo_front"] = file_path
+    context.user_data["photo_url"] = photo_url
 
     # Concurrently detect barcode and extract product name from packaging via AI
     detected_barcode, detected_name = await asyncio.gather(
@@ -494,7 +497,8 @@ async def handle_incoming_photo(update: Update, context: ContextTypes.DEFAULT_TY
             barcode=barcode,
             item_name=name,
             qty=qty,
-            photo_front=file_path
+            photo_front=file_path,
+            photo_url=photo_url
         )
         sync_manager.enqueue(record)
         qty_display = int(qty) if qty.is_integer() else qty
@@ -528,7 +532,7 @@ async def handle_incoming_photo(update: Update, context: ContextTypes.DEFAULT_TY
 async def flow_receive_barcode_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if update.message and update.message.photo:
         photo = update.message.photo[-1]
-        file_path = await save_tg_photo(photo.file_id, context, prefix="barcode")
+        file_path, _ = await save_tg_photo(photo.file_id, context, prefix="barcode")
         context.user_data["photo_barcode"] = file_path
         detected = detect_barcode_from_image(file_path)
         if detected:
@@ -625,6 +629,7 @@ async def finalize_and_save_count(update: Update, context: ContextTypes.DEFAULT_
     qty = context.user_data.get("qty", 1.0)
     photo_front = context.user_data.get("photo_front")
     photo_barcode = context.user_data.get("photo_barcode")
+    photo_url = context.user_data.get("photo_url", "")
 
     record = await db_insert_count(
         user_id=user.id if user else 0,
@@ -634,7 +639,8 @@ async def finalize_and_save_count(update: Update, context: ContextTypes.DEFAULT_
         item_name=item_name,
         qty=qty,
         photo_front=photo_front,
-        photo_barcode=photo_barcode
+        photo_barcode=photo_barcode,
+        photo_url=photo_url
     )
 
     sync_manager.enqueue(record)
