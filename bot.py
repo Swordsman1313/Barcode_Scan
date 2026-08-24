@@ -1,11 +1,11 @@
 """
 =============================================================================
-STORE STOCK SCAN BOT — SMART DUAL-PHOTO & ANY-ORDER AUTO NAMER
+STORE STOCK SCAN BOT — RETAIL & RAW MATERIAL SUPPORT
 =============================================================================
-- Primary AI Vision Engine: Gemini 3.5 Flash & Gemini 3.7 Flash
-- Works with photos in ANY order (Front first OR Barcode first)
-- Auto-extracts Barcode via zxing-cpp
-- Smart Photo Sorting: Front in Column G and Barcode in Column H
+- Retail Goods: 100% Automatic AI Packaging Reader & Barcode Decoder
+- Raw Materials: Easily type manual Item Name & Skip Barcodes
+- Dual HD Photos: Pushes both Front Photo & Barcode Photo to Google Sheets
+- Works with photos in ANY order
 - Clickable Full HD images in Google Sheets
 =============================================================================
 """
@@ -94,7 +94,7 @@ logging.basicConfig(
 logger = logging.getLogger("StockBot")
 
 # Conversation States
-STATE_BARCODE_PHOTO, STATE_SHELF, STATE_BARCODE, STATE_QTY = range(4)
+STATE_BARCODE_PHOTO, STATE_SHELF, STATE_BARCODE, STATE_ITEM_NAME, STATE_QTY = range(5)
 
 
 # ---------------------------------------------------------------------------
@@ -227,9 +227,7 @@ def get_gemini_models_list() -> List[str]:
         "models/gemini-3.5-flash-lite",
         "models/gemini-3.7-flash",
         "models/gemini-flash-latest",
-        "models/gemini-2.5-flash",
-        "models/gemini-2.5-pro",
-        "models/gemini-1.5-flash"
+        "models/gemini-2.5-flash"
     ]
 
 
@@ -250,7 +248,8 @@ async def extract_product_name_from_image(image_path: str) -> Optional[str]:
         "Look at this product photo. Read the main printed product name and brand on the packaging. "
         "Return ONLY the concise Brand Name and Product Name (including flavor or size if visible, maximum 5 words). "
         "Do NOT include markdown, asterisks, quotes, bullet points, or filler words. "
-        "Example: 'Jardo Seaweed Rice Chip' or 'Lay's Classic 50g' or 'Taro Fish Snack'."
+        "Example: 'Jardo Seaweed Rice Chip' or 'Lay's Classic 50g' or 'Taro Fish Snack'. "
+        "If it is a raw unbranded material or vegetable without text, return ONLY '-'."
     )
 
     payload = {
@@ -284,7 +283,7 @@ async def extract_product_name_from_image(image_path: str) -> Optional[str]:
                         if candidates:
                             text = candidates[0].get("content", {}).get("parts", [{}])[0].get("text", "")
                             clean_name = text.strip().replace("\n", " ").replace("*", "").replace('"', '').strip()
-                            if clean_name and len(clean_name) > 2 and "unknown" not in clean_name.lower():
+                            if clean_name and len(clean_name) > 1 and clean_name != "-" and "unknown" not in clean_name.lower():
                                 logger.info(f"✨ AI Vision ({model_name}) extracted name: '{clean_name}'")
                                 return clean_name
                     elif resp.status in (404, 429):
@@ -524,12 +523,12 @@ async def save_tg_photo(file_id: str, context: ContextTypes.DEFAULT_TYPE, prefix
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = (
         f"👋 *Store Stock Count Bot Active!*\n\n"
-        f"👉 *How to count an item:*\n"
-        f"1️⃣ **Send a photo of the product front or barcode** 📸\n"
-        f"2️⃣ Send the second photo (or tap Skip)\n"
-        f"3️⃣ Type Shelf (e.g. `G101`)\n"
+        f"👉 *How to count items:*\n"
+        f"1️⃣ **Send a photo of the product front or raw material** 📸\n"
+        f"2️⃣ Send the barcode photo (or tap Skip)\n"
+        f"3️⃣ Type Shelf (e.g. `G101`, `RM-01`)\n"
         f"4️⃣ Type Quantity (e.g. `12`)\n\n"
-        f"⚡ *Auto-reads product name from packaging & syncs live to Google Sheets!*"
+        f"⚡ *Auto-reads packaging names or lets you type raw material names easily!*"
     )
     await update.message.reply_text(
         msg,
@@ -545,7 +544,7 @@ async def cmd_testai(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ---------------------------------------------------------------------------
-# 8. PHOTO FLOW (Works with any order of photos)
+# 8. PHOTO FLOW (Retail Goods & Raw Materials)
 # ---------------------------------------------------------------------------
 async def handle_incoming_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data.clear()
@@ -616,10 +615,12 @@ async def handle_incoming_photo(update: Update, context: ContextTypes.DEFAULT_TY
     name_status = f"\n📦 *Item:* `{detected_name}` (Auto-detected ✨)" if detected_name else ""
     barcode_status = f"\n🏷️ *Barcode:* `{detected_barcode}`" if detected_barcode else ""
 
-    kb = InlineKeyboardMarkup([[InlineKeyboardButton("⏩ Skip (Done with 1 photo)", callback_data="skip_barcode_photo")]])
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("⏩ Skip (No Barcode / Raw Material)", callback_data="skip_barcode_photo")]
+    ])
     await update.message.reply_text(
         f"📸 *Photo 1 Received!*{name_status}{barcode_status}\n\n"
-        f"📷 Now send **Photo 2** (or tap Skip if done):",
+        f"📷 Send **Photo 2 (Barcode label)**\n_(Or tap Skip if Raw Material / Done):_",
         reply_markup=kb,
         parse_mode="Markdown"
     )
@@ -631,7 +632,7 @@ async def flow_receive_barcode_photo(update: Update, context: ContextTypes.DEFAU
         photo = update.message.photo[-1]
         file_path, photo_url = await save_tg_photo(photo.file_id, context, prefix="p2")
         
-        # Check both barcode and name on Photo 2 as well!
+        # Check both barcode and name on Photo 2 as well
         detected_barcode, detected_name = await asyncio.gather(
             asyncio.to_thread(detect_barcode_from_image, file_path),
             extract_product_name_from_image(file_path) if not context.user_data.get("item_name") else asyncio.sleep(0)
@@ -663,7 +664,7 @@ async def flow_skip_barcode_photo_cb(update: Update, context: ContextTypes.DEFAU
 async def prompt_shelf_step(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     target = update.callback_query.message if update.callback_query else update.message
     await target.reply_text(
-        "📍 *Please type the Shelf Code* (e.g. `G101`, `A12`, `B05`):",
+        "📍 *Please type the Shelf Code* (e.g. `G101`, `RM-01`, `A12`):",
         parse_mode="Markdown"
     )
     return STATE_SHELF
@@ -675,27 +676,22 @@ async def flow_shelf_text(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await update.message.reply_text("⚠️ Please type the Shelf Code (e.g. `G101`):")
         return STATE_SHELF
     context.user_data["shelf"] = shelf
-    return await check_barcode_and_prompt_qty(update, context)
+    return await check_barcode_step(update, context)
 
 
-async def check_barcode_and_prompt_qty(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+async def check_barcode_step(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     detected_barcode = context.user_data.get("detected_barcode")
     target = update.callback_query.message if update.callback_query else update.message
 
     if detected_barcode:
         context.user_data["barcode"] = detected_barcode
-        await target.reply_text(
-            f"🏷️ *Barcode:* `{detected_barcode}` (Auto-detected ✨)\n\n"
-            f"🔢 *Please type the Quantity (QTY):*\n_(e.g. 1, 5, 12, 24)_",
-            parse_mode="Markdown"
-        )
-        return STATE_QTY
+        return await check_item_name_step(update, context)
 
     kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("⏩ Skip Barcode Number", callback_data="skip_barcode_num")]
+        [InlineKeyboardButton("⏩ Skip Barcode (Raw Material / No Code)", callback_data="skip_barcode_num")]
     ])
     await target.reply_text(
-        "🏷️ Please type the **Barcode numbers** from the label:\n_(Or tap Skip):_",
+        "🏷️ Type **Barcode numbers** (Or tap Skip if Raw Material):",
         reply_markup=kb,
         parse_mode="Markdown"
     )
@@ -707,14 +703,54 @@ async def flow_barcode_callback(update: Update, context: ContextTypes.DEFAULT_TY
     await query.answer()
     if query.data == "skip_barcode_num":
         context.user_data["barcode"] = "NO_BARCODE"
-        await query.message.reply_text("🔢 *Please type the Quantity (QTY):*\n_(e.g. 1, 5, 12, 24)_", parse_mode="Markdown")
-        return STATE_QTY
+        return await check_item_name_step(update, context)
     return STATE_BARCODE
 
 
 async def flow_barcode_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     barcode = update.message.text.strip()
     context.user_data["barcode"] = barcode or "NO_BARCODE"
+    return await check_item_name_step(update, context)
+
+
+async def check_item_name_step(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    target = update.callback_query.message if update.callback_query else update.message
+    current_name = context.user_data.get("item_name")
+
+    # If AI already detected a name from packaging, proceed directly to QTY
+    if current_name and current_name != "-" and len(current_name.strip()) > 1:
+        await target.reply_text(
+            f"📦 *Item:* `{current_name}` (Auto-detected ✨)\n\n"
+            f"🔢 *Please type the Quantity (QTY):*\n_(e.g. 1, 5, 12, 24)_",
+            parse_mode="Markdown"
+        )
+        return STATE_QTY
+
+    # If NO name was detected (e.g. Raw Material / Unbranded), ask user to type name
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("⏩ Skip Name", callback_data="skip_item_name")]
+    ])
+    await target.reply_text(
+        "📦 *Please type the Item Name:*\n_(e.g. Sugar 50kg, Raw Cashew, Flour Bag)_",
+        reply_markup=kb,
+        parse_mode="Markdown"
+    )
+    return STATE_ITEM_NAME
+
+
+async def flow_item_name_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    if query.data == "skip_item_name":
+        context.user_data["item_name"] = "-"
+        await query.message.reply_text("🔢 *Please type the Quantity (QTY):*\n_(e.g. 1, 5, 12, 24)_", parse_mode="Markdown")
+        return STATE_QTY
+    return STATE_ITEM_NAME
+
+
+async def flow_item_name_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    name = update.message.text.strip()
+    context.user_data["item_name"] = name or "-"
     await update.message.reply_text("🔢 *Please type the Quantity (QTY):*\n_(e.g. 1, 5, 12, 24)_", parse_mode="Markdown")
     return STATE_QTY
 
@@ -846,6 +882,11 @@ async def main_async():
             STATE_BARCODE: [
                 CallbackQueryHandler(flow_barcode_callback, pattern="^skip_barcode_num$"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, flow_barcode_text),
+                CommandHandler("cancel", flow_cancel)
+            ],
+            STATE_ITEM_NAME: [
+                CallbackQueryHandler(flow_item_name_callback, pattern="^skip_item_name$"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, flow_item_name_text),
                 CommandHandler("cancel", flow_cancel)
             ],
             STATE_QTY: [
