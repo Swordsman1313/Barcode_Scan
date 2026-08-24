@@ -1,12 +1,12 @@
 """
 =============================================================================
-STORE STOCK COUNT TELEGRAM BOT — MANUAL TYPING & GROUP READY EDITION
+STORE STOCK COUNT TELEGRAM BOT — MANUAL QTY & GOOGLE SHEETS READY
 =============================================================================
-- Full manual shelf typing (Supports any shelf code: G101, A-12, Z999, etc.)
-- Smart "Keep Last Shelf" 1-tap button for fast continuous counting
-- Full Telegram Group Chat Support (Reads group text messages)
-- 1-Shot quick caption support (Send photo with caption "G101 8850123456789 Coke 12")
-- Google Sheets Real-time Auto-fill & Excel (.xlsx) export
+- Manual Shelf & Manual Quantity typing
+- Smart "Keep Last Shelf" button for fast repeat scans
+- Real-time Google Sheets Auto-Fill via Webhook
+- Instant Excel (.xlsx) Export
+- 24/7 Cloud Ready
 =============================================================================
 """
 
@@ -93,32 +93,6 @@ def get_main_reply_keyboard() -> ReplyKeyboardMarkup:
         [KeyboardButton("📊 Export Excel"), KeyboardButton("📈 View Stats")]
     ]
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-
-
-def get_quick_qty_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("1", callback_data="qty_1"),
-            InlineKeyboardButton("2", callback_data="qty_2"),
-            InlineKeyboardButton("3", callback_data="qty_3"),
-            InlineKeyboardButton("4", callback_data="qty_4"),
-        ],
-        [
-            InlineKeyboardButton("5", callback_data="qty_5"),
-            InlineKeyboardButton("6", callback_data="qty_6"),
-            InlineKeyboardButton("10", callback_data="qty_10"),
-            InlineKeyboardButton("12", callback_data="qty_12"),
-        ],
-        [
-            InlineKeyboardButton("24", callback_data="qty_24"),
-            InlineKeyboardButton("36", callback_data="qty_36"),
-            InlineKeyboardButton("48", callback_data="qty_48"),
-            InlineKeyboardButton("100", callback_data="qty_100"),
-        ],
-        [
-            InlineKeyboardButton("✏️ Type Custom Number", callback_data="qty_custom")
-        ]
-    ])
 
 
 # ---------------------------------------------------------------------------
@@ -646,7 +620,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"👉 *How to count an item:*\n"
         f"1️⃣ **Just send a photo of the item** 📸\n"
         f"2️⃣ Type your Shelf (e.g. `G101`)\n"
-        f"3️⃣ Confirm/Type Barcode & QTY!\n\n"
+        f"3️⃣ Confirm Barcode & type Quantity!\n\n"
         f"💡 *Super Fast Pro Tip:*\n"
         f"Send photo with caption: `G101 8850123456789 Coke 12`\n"
         f"*(It will save instantly in 1 second!)*"
@@ -728,7 +702,7 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ---------------------------------------------------------------------------
-# 9. PHOTO FLOW (Pure Manual Typing + Fast Smart Defaults)
+# 9. PHOTO FLOW (Pure Manual Typing: Shelf -> Barcode -> Name -> QTY)
 # ---------------------------------------------------------------------------
 async def handle_incoming_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data.clear()
@@ -812,7 +786,6 @@ async def prompt_shelf_step(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     target = update.callback_query.message if update.callback_query else update.message
 
     if active_shelf:
-        # Give 1-tap button to keep current shelf OR simply type any shelf code
         kb = InlineKeyboardMarkup([
             [InlineKeyboardButton(f"✅ Keep Current Shelf: {active_shelf}", callback_data=f"shelf_keep_{active_shelf}")]
         ])
@@ -919,35 +892,24 @@ async def flow_item_name_text(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
 async def prompt_qty_step(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Prompts crew to type the exact quantity."""
     target = update.callback_query.message if update.callback_query else update.message
-    await target.reply_text("🔢 *Select or Type Quantity (QTY):*", reply_markup=get_quick_qty_keyboard(), parse_mode="Markdown")
+    await target.reply_text("🔢 *Please type the Quantity (QTY):*\n_(e.g. 1, 5, 12, 24, 50)_", parse_mode="Markdown")
     return STATE_QTY
 
 
-async def flow_qty_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    query = update.callback_query
-    await query.answer()
-    val = query.data.replace("qty_", "")
-    if val == "custom":
-        await query.message.reply_text("🔢 Please type the exact **Quantity** number (e.g. `15`):", parse_mode="Markdown")
-        return STATE_QTY
-    try:
-        context.user_data["qty"] = float(val)
-        return await finalize_and_save_count(update, context)
-    except ValueError:
-        return STATE_QTY
-
-
 async def flow_qty_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Receives manually typed quantity."""
+    text = update.message.text.strip() if update.message and update.message.text else ""
     try:
-        qty = float(update.message.text.strip())
+        qty = float(text)
         if qty <= 0:
-            await update.message.reply_text("⚠️ Quantity must be > 0.")
+            await update.message.reply_text("⚠️ Quantity must be greater than 0. Please type a number (e.g. 12):")
             return STATE_QTY
         context.user_data["qty"] = qty
         return await finalize_and_save_count(update, context)
     except ValueError:
-        await update.message.reply_text("⚠️ Please enter a number (e.g. `12`):")
+        await update.message.reply_text("⚠️ Please enter a valid number (e.g. `12` or `5`):")
         return STATE_QTY
 
 
@@ -1068,7 +1030,6 @@ async def main_async():
                 CommandHandler("cancel", flow_cancel)
             ],
             STATE_QTY: [
-                CallbackQueryHandler(flow_qty_callback, pattern="^qty_"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, flow_qty_text),
                 CommandHandler("cancel", flow_cancel)
             ]
