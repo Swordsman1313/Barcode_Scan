@@ -1,11 +1,12 @@
 """
 =============================================================================
-STORE STOCK SCAN BOT — AI PACKAGING READER & DUAL PHOTO GOOGLE SHEETS
+STORE STOCK SCAN BOT — SMART DUAL-PHOTO & ANY-ORDER AUTO NAMER
 =============================================================================
-- AI Vision: Automatically reads text & brand directly from product packaging
-- Dual HD Photos: Pushes both Front Photo & Barcode Photo to Google Sheets
-- Real-time Diagnostic Feedback (Shows detected name or key status immediately)
-- Zero master product data needed (100% photo-based visual AI)
+- Works with photos in ANY order (Front first OR Barcode first)
+- Auto-extracts Product Name from BOTH Photo 1 and Photo 2 via AI Vision
+- Auto-extracts Barcode from BOTH Photo 1 and Photo 2 via zxing-cpp
+- Smart Photo Sorting: Automatically puts Front in Column G and Barcode in Column H
+- Clickable HD images in Google Sheets
 =============================================================================
 """
 
@@ -198,7 +199,7 @@ async def db_mark_synced(count_ids: list):
 
 
 # ---------------------------------------------------------------------------
-# 3. AI VISION: READS BRAND & PACKAGING DIRECTLY FROM PHOTO
+# 3. AI VISION: READS BRAND & PACKAGING FROM PHOTO
 # ---------------------------------------------------------------------------
 def compress_image_for_ai(image_path: str) -> Optional[str]:
     try:
@@ -215,28 +216,24 @@ def compress_image_for_ai(image_path: str) -> Optional[str]:
         return None
 
 
-async def extract_product_name_from_image(image_path: str) -> Tuple[Optional[str], Optional[str]]:
-    """
-    Calls Google Gemini Vision to read text from product packaging.
-    Returns: (detected_name, status_message)
-    """
+async def extract_product_name_from_image(image_path: str) -> Optional[str]:
     if not image_path or not os.path.exists(image_path):
-        return None, "File not found"
+        return None
 
     api_key = GEMINI_API_KEY
     if not api_key:
-        logger.warning("⚠️ GEMINI_API_KEY is not set in Environment Variables.")
-        return None, "⚠️ GEMINI_API_KEY missing in Render"
+        logger.warning("⚠️ GEMINI_API_KEY is not set.")
+        return None
 
     img_b64 = await asyncio.to_thread(compress_image_for_ai, image_path)
     if not img_b64:
-        return None, "Image compression failed"
+        return None
 
     prompt = (
-        "Look at this product packaging image. Read the main product name and brand printed on the front. "
-        "Return ONLY the concise Brand and Product Name (including flavor or size if visible, maximum 5 words). "
-        "Do NOT include markdown, asterisks, bullet points, quotes, or filler. "
-        "Example output: 'Jardo Seaweed Rice Chip' or 'Lay's Classic 50g' or 'Coca Cola 325ml'."
+        "Look at this product photo. Read the main printed product name and brand on the packaging. "
+        "Return ONLY the concise Brand Name and Product Name (including flavor or size if visible, maximum 5 words). "
+        "Do NOT include markdown, asterisks, quotes, bullet points, or filler words. "
+        "Example: 'Jardo Seaweed Rice Chip' or 'Lay's Classic 50g' or 'Taro Fish Snack'."
     )
 
     models = [
@@ -247,7 +244,6 @@ async def extract_product_name_from_image(image_path: str) -> Tuple[Optional[str
         "gemini-1.5-pro"
     ]
     
-    last_error = ""
     for model in models:
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
         headers = {"Content-Type": "application/json"}
@@ -274,18 +270,13 @@ async def extract_product_name_from_image(image_path: str) -> Tuple[Optional[str
                         if candidates:
                             text = candidates[0].get("content", {}).get("parts", [{}])[0].get("text", "")
                             clean_name = text.strip().replace("\n", " ").replace("*", "").replace('"', '').strip()
-                            if clean_name and len(clean_name) > 2:
-                                logger.info(f"✨ AI Vision ({model}) read name from packaging: '{clean_name}'")
-                                return clean_name, "OK"
-                    else:
-                        last_error = f"API Status {resp.status}"
-                        err_text = await resp.text()
-                        logger.warning(f"Gemini Vision API ({model}) returned {resp.status}: {err_text}")
+                            if clean_name and len(clean_name) > 2 and "unknown" not in clean_name.lower():
+                                logger.info(f"✨ AI Vision ({model}) detected: '{clean_name}'")
+                                return clean_name
         except Exception as e:
-            last_error = str(e)
-            logger.debug(f"Gemini API ({model}) exception: {e}")
+            logger.debug(f"Gemini API ({model}) check error: {e}")
 
-    return None, last_error or "AI could not recognize name"
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -323,7 +314,7 @@ def detect_barcode_from_image(image_path: str) -> Optional[str]:
 
 
 # ---------------------------------------------------------------------------
-# 5. GOOGLE SHEETS ASYNC BACKGROUND SYNC (Dual Photos: Front + Barcode)
+# 5. GOOGLE SHEETS ASYNC BACKGROUND SYNC (Dual Photos)
 # ---------------------------------------------------------------------------
 class SheetsSyncManager:
     def __init__(self, webhook_url: Optional[str] = None):
@@ -481,8 +472,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = (
         f"👋 *Store Stock Count Bot Active!*\n\n"
         f"👉 *How to count an item:*\n"
-        f"1️⃣ **Send a photo of the product front** 📸\n"
-        f"2️⃣ Send barcode photo (or tap Skip)\n"
+        f"1️⃣ **Send a photo of the product front or barcode** 📸\n"
+        f"2️⃣ Send the second photo (or tap Skip)\n"
         f"3️⃣ Type Shelf (e.g. `G101`)\n"
         f"4️⃣ Type Quantity (e.g. `12`)\n\n"
         f"⚡ *Auto-reads product name from packaging & syncs live to Google Sheets!*"
@@ -495,7 +486,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ---------------------------------------------------------------------------
-# 8. PHOTO FLOW (Front Photo -> Barcode Photo -> Shelf -> Quantity -> Saved)
+# 8. PHOTO FLOW (Works with any order of photos)
 # ---------------------------------------------------------------------------
 async def handle_incoming_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data.clear()
@@ -503,29 +494,37 @@ async def handle_incoming_photo(update: Update, context: ContextTypes.DEFAULT_TY
     crew_name = get_user_display_name(update)
 
     photo = update.message.photo[-1]
-    file_path, photo_front_url = await save_tg_photo(photo.file_id, context, prefix="front")
-    context.user_data["photo_front"] = file_path
-    context.user_data["photo_front_url"] = photo_front_url
+    file_path, photo_url = await save_tg_photo(photo.file_id, context, prefix="p1")
+    context.user_data["photo1_path"] = file_path
+    context.user_data["photo1_url"] = photo_url
 
-    # Concurrently detect barcode and extract product name from packaging via AI
-    detected_barcode, (ai_name, ai_status) = await asyncio.gather(
+    # Check both barcode and name on Photo 1
+    detected_barcode, detected_name = await asyncio.gather(
         asyncio.to_thread(detect_barcode_from_image, file_path),
         extract_product_name_from_image(file_path)
     )
 
-    detected_name = ai_name or "-"
-    context.user_data["item_name"] = detected_name
-
     if detected_barcode:
         context.user_data["detected_barcode"] = detected_barcode
+        context.user_data["photo_barcode_path"] = file_path
+        context.user_data["photo_barcode_url"] = photo_url
+    else:
+        context.user_data["photo_front_path"] = file_path
+        context.user_data["photo_front_url"] = photo_url
+
+    if detected_name:
+        context.user_data["item_name"] = detected_name
 
     caption = update.message.caption or ""
     quick_data = parse_quick_caption(caption, detected_barcode=detected_barcode)
 
     if quick_data:
         shelf, barcode, name, qty = quick_data
-        if name == "-" and detected_name != "-":
+        if name == "-" and detected_name:
             name = detected_name
+
+        front_url = context.user_data.get("photo_front_url") or photo_url
+        barcode_url = context.user_data.get("photo_barcode_url") or ""
 
         record = await db_insert_count(
             user_id=user.id if user else 0,
@@ -535,7 +534,8 @@ async def handle_incoming_photo(update: Update, context: ContextTypes.DEFAULT_TY
             item_name=name,
             qty=qty,
             photo_front=file_path,
-            photo_front_url=photo_front_url
+            photo_front_url=front_url,
+            photo_barcode_url=barcode_url
         )
         sync_manager.enqueue(record)
         qty_display = int(qty) if qty.is_integer() else qty
@@ -554,17 +554,13 @@ async def handle_incoming_photo(update: Update, context: ContextTypes.DEFAULT_TY
         )
         return ConversationHandler.END
 
-    if detected_name != "-":
-        name_status = f"\n📦 *Item:* `{detected_name}` (Auto-detected from packaging ✨)"
-    elif "missing" in ai_status.lower():
-        name_status = f"\n⚠️ *Note:* `GEMINI_API_KEY` is not set on Render."
-    else:
-        name_status = ""
+    name_status = f"\n📦 *Item:* `{detected_name}` (Auto-detected ✨)" if detected_name else ""
+    barcode_status = f"\n🏷️ *Barcode:* `{detected_barcode}`" if detected_barcode else ""
 
-    kb = InlineKeyboardMarkup([[InlineKeyboardButton("⏩ Skip (Barcode is in this photo)", callback_data="skip_barcode_photo")]])
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("⏩ Skip (Done with 1 photo)", callback_data="skip_barcode_photo")]])
     await update.message.reply_text(
-        f"📸 *Photo 1 Received (Packaging Front)!*{name_status}\n\n"
-        f"📷 Now send **Photo 2 (Barcode label)** (or tap Skip below):",
+        f"📸 *Photo 1 Received!*{name_status}{barcode_status}\n\n"
+        f"📷 Now send **Photo 2** (or tap Skip if done):",
         reply_markup=kb,
         parse_mode="Markdown"
     )
@@ -574,13 +570,27 @@ async def handle_incoming_photo(update: Update, context: ContextTypes.DEFAULT_TY
 async def flow_receive_barcode_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if update.message and update.message.photo:
         photo = update.message.photo[-1]
-        file_path, photo_barcode_url = await save_tg_photo(photo.file_id, context, prefix="barcode")
-        context.user_data["photo_barcode"] = file_path
-        context.user_data["photo_barcode_url"] = photo_barcode_url
+        file_path, photo_url = await save_tg_photo(photo.file_id, context, prefix="p2")
         
-        detected = detect_barcode_from_image(file_path)
-        if detected:
-            context.user_data["detected_barcode"] = detected
+        # Check both barcode and name on Photo 2 as well!
+        detected_barcode, detected_name = await asyncio.gather(
+            asyncio.to_thread(detect_barcode_from_image, file_path),
+            extract_product_name_from_image(file_path) if not context.user_data.get("item_name") else asyncio.sleep(0)
+        )
+        
+        if detected_barcode and not context.user_data.get("detected_barcode"):
+            context.user_data["detected_barcode"] = detected_barcode
+            context.user_data["photo_barcode_path"] = file_path
+            context.user_data["photo_barcode_url"] = photo_url
+        elif not context.user_data.get("photo_front_url"):
+            context.user_data["photo_front_path"] = file_path
+            context.user_data["photo_front_url"] = photo_url
+        else:
+            context.user_data["photo_barcode_path"] = file_path
+            context.user_data["photo_barcode_url"] = photo_url
+            
+        if detected_name and isinstance(detected_name, str) and not context.user_data.get("item_name"):
+            context.user_data["item_name"] = detected_name
             
     return await prompt_shelf_step(update, context)
 
@@ -588,8 +598,6 @@ async def flow_receive_barcode_photo(update: Update, context: ContextTypes.DEFAU
 async def flow_skip_barcode_photo_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
-    context.user_data["photo_barcode"] = None
-    context.user_data["photo_barcode_url"] = ""
     return await prompt_shelf_step(update, context)
 
 
@@ -671,11 +679,12 @@ async def finalize_and_save_count(update: Update, context: ContextTypes.DEFAULT_
     crew_name = get_user_display_name(update)
     shelf = context.user_data.get("shelf", "UNKNOWN")
     barcode = context.user_data.get("barcode", "NO_BARCODE")
-    item_name = context.user_data.get("item_name", "-")
+    item_name = context.user_data.get("item_name") or "-"
     qty = context.user_data.get("qty", 1.0)
-    photo_front = context.user_data.get("photo_front")
-    photo_barcode = context.user_data.get("photo_barcode")
-    photo_front_url = context.user_data.get("photo_front_url", "")
+    
+    photo_front = context.user_data.get("photo_front_path") or context.user_data.get("photo1_path")
+    photo_barcode = context.user_data.get("photo_barcode_path")
+    photo_front_url = context.user_data.get("photo_front_url") or context.user_data.get("photo1_url", "")
     photo_barcode_url = context.user_data.get("photo_barcode_url", "")
 
     record = await db_insert_count(
