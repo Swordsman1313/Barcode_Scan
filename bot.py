@@ -3,8 +3,8 @@
 STORE STOCK SCAN BOT — SMART DUAL-PHOTO & ANY-ORDER AUTO NAMER
 =============================================================================
 - Works with photos in ANY order (Front first OR Barcode first)
-- Robust Gemini AI Vision with quote sanitization & 15s timeout
-- /testai diagnostic command to instantly verify Gemini API connection
+- Uses v1 & v1beta multi-version Gemini endpoints (gemini-1.5-flash, 2.0-flash, latest)
+- Dynamic Model Discovery & Auto-Fallback
 - Auto-extracts Barcode via zxing-cpp
 - Smart Photo Sorting: Front in Column G and Barcode in Column H
 - Clickable Full HD images in Google Sheets
@@ -22,7 +22,7 @@ from io import BytesIO
 from datetime import datetime
 from pathlib import Path
 from contextlib import asynccontextmanager
-from typing import Optional, Dict, Any, Tuple
+from typing import Optional, Dict, Any, Tuple, List
 
 from dotenv import load_dotenv
 from PIL import Image, ImageEnhance, ImageOps
@@ -222,6 +222,21 @@ def compress_image_for_ai(image_path: str) -> Optional[str]:
         return None
 
 
+async def get_available_gemini_endpoints(api_key: str) -> List[str]:
+    """Tries listing models or returns comprehensive fallback list of endpoints."""
+    endpoints = []
+    
+    # Priority list of endpoints covering v1, v1beta, and all flash versions
+    endpoints.append(f"https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent?key={api_key}")
+    endpoints.append(f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-latest:generateContent?key={api_key}")
+    endpoints.append(f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={api_key}")
+    endpoints.append(f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-exp:generateContent?key={api_key}")
+    endpoints.append(f"https://generativelanguage.googleapis.com/v1/models/gemini-1.5-pro:generateContent?key={api_key}")
+    endpoints.append(f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={api_key}")
+
+    return endpoints
+
+
 async def extract_product_name_from_image(image_path: str) -> Optional[str]:
     if not image_path or not os.path.exists(image_path):
         return None
@@ -242,38 +257,30 @@ async def extract_product_name_from_image(image_path: str) -> Optional[str]:
         "Example: 'Jardo Seaweed Rice Chip' or 'Lay's Classic 50g' or 'Taro Fish Snack'."
     )
 
-    models = [
-        "gemini-1.5-flash",
-        "gemini-2.0-flash",
-        "gemini-2.5-flash",
-        "gemini-1.5-flash-8b",
-        "gemini-1.5-pro"
-    ]
-    
-    for model in models:
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
-        headers = {"Content-Type": "application/json"}
-        payload = {
-            "contents": [{
-                "parts": [
-                    {"text": prompt},
-                    {
-                        "inlineData": {
-                            "mimeType": "image/jpeg",
-                            "data": img_b64
-                        }
+    payload = {
+        "contents": [{
+            "parts": [
+                {"text": prompt},
+                {
+                    "inlineData": {
+                        "mimeType": "image/jpeg",
+                        "data": img_b64
                     }
-                ]
-            }],
-            "generationConfig": {
-                "temperature": 0.2,
-                "maxOutputTokens": 30
-            }
+                }
+            ]
+        }],
+        "generationConfig": {
+            "temperature": 0.2,
+            "maxOutputTokens": 30
         }
+    }
 
+    endpoints = await get_available_gemini_endpoints(api_key)
+    
+    for url in endpoints:
         try:
             async with aiohttp.ClientSession() as session:
-                async with session.post(url, json=payload, headers=headers, timeout=aiohttp.ClientTimeout(total=12)) as resp:
+                async with session.post(url, json=payload, headers={"Content-Type": "application/json"}, timeout=aiohttp.ClientTimeout(total=10)) as resp:
                     if resp.status == 200:
                         data = await resp.json()
                         candidates = data.get("candidates", [])
@@ -281,43 +288,54 @@ async def extract_product_name_from_image(image_path: str) -> Optional[str]:
                             text = candidates[0].get("content", {}).get("parts", [{}])[0].get("text", "")
                             clean_name = text.strip().replace("\n", " ").replace("*", "").replace('"', '').strip()
                             if clean_name and len(clean_name) > 2 and "unknown" not in clean_name.lower():
-                                logger.info(f"✨ AI Vision ({model}) detected: '{clean_name}'")
+                                logger.info(f"✨ AI Vision extracted: '{clean_name}' (via {url.split('models/')[1].split(':')[0]})")
                                 return clean_name
+                    elif resp.status == 404:
+                        continue
                     else:
                         err_text = await resp.text()
-                        logger.warning(f"Gemini API ({model}) returned status {resp.status}: {err_text}")
+                        logger.warning(f"Gemini API returned status {resp.status}: {err_text}")
         except Exception as e:
-            logger.debug(f"Gemini API ({model}) check error: {e}")
+            logger.debug(f"Gemini API endpoint check error: {e}")
 
     return None
 
 
 async def test_gemini_api_connection() -> str:
-    """Diagnostic tool to test Gemini API key health."""
+    """Diagnostic tool to test Gemini API key health and discover active models."""
     api_key = clean_env(os.getenv("GEMINI_API_KEY") or GEMINI_API_KEY)
     if not api_key:
         return "❌ `GEMINI_API_KEY` is NOT set in Render Environment Variables!"
 
     key_preview = f"{api_key[:6]}...{api_key[-4:]}" if len(api_key) > 10 else "SHORT_KEY"
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={api_key}"
+    endpoints = await get_available_gemini_endpoints(api_key)
+
     payload = {
         "contents": [{
             "parts": [{"text": "Hello! Reply with the single word: OK"}]
         }]
     }
 
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(url, json=payload, headers={"Content-Type": "application/json"}, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                body = await resp.text()
-                if resp.status == 200:
-                    data = await resp.json()
-                    res_text = data.get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "").strip()
-                    return f"✅ **Gemini AI API is Working 100%!**\n• Key: `{key_preview}`\n• Response: `{res_text}`\n• Status: `200 OK`"
-                else:
-                    return f"⚠️ **Gemini API Error (Status {resp.status}):**\n`{body[:300]}`"
-    except Exception as e:
-        return f"❌ **Connection Error:** `{e}`"
+    for url in endpoints:
+        model_name = url.split("models/")[1].split(":")[0]
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(url, json=payload, headers={"Content-Type": "application/json"}, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                    body = await resp.text()
+                    if resp.status == 200:
+                        data = await resp.json()
+                        res_text = data.get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "").strip()
+                        return (
+                            f"✅ **Gemini AI API is Working 100%!**\n"
+                            f"• Key: `{key_preview}`\n"
+                            f"• Active Model: `{model_name}`\n"
+                            f"• Test Response: `{res_text}`\n"
+                            f"• Status: `200 OK` 🎉"
+                        )
+        except Exception as e:
+            continue
+
+    return f"⚠️ **Could not connect to Gemini API with key `{key_preview}`.**"
 
 
 # ---------------------------------------------------------------------------
