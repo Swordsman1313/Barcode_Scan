@@ -1,11 +1,12 @@
 """
 =============================================================================
-STORE STOCK COUNT TELEGRAM BOT — GROUP INTERACTIVE BUTTON EDITION
+STORE STOCK COUNT TELEGRAM BOT — MANUAL TYPING & GROUP READY EDITION
 =============================================================================
-- Interactive Inline Buttons for Shelves (G101, G102, etc.) — 100% works in groups
-- Auto barcode scanner from photos (zxing-cpp)
-- 1-Tap Quantity buttons
-- Full support for Group Privacy Mode
+- Full manual shelf typing (Supports any shelf code: G101, A-12, Z999, etc.)
+- Smart "Keep Last Shelf" 1-tap button for fast continuous counting
+- Full Telegram Group Chat Support (Reads group text messages)
+- 1-Shot quick caption support (Send photo with caption "G101 8850123456789 Coke 12")
+- Google Sheets Real-time Auto-fill & Excel (.xlsx) export
 =============================================================================
 """
 
@@ -84,7 +85,7 @@ logger = logging.getLogger("StockBot")
 
 
 # ---------------------------------------------------------------------------
-# 2. KEYBOARDS (Interactive for Groups & Private)
+# 2. KEYBOARDS
 # ---------------------------------------------------------------------------
 def get_main_reply_keyboard() -> ReplyKeyboardMarkup:
     keyboard = [
@@ -92,33 +93,6 @@ def get_main_reply_keyboard() -> ReplyKeyboardMarkup:
         [KeyboardButton("📊 Export Excel"), KeyboardButton("📈 View Stats")]
     ]
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-
-
-def get_shelf_keyboard(active_shelf: Optional[str] = None) -> InlineKeyboardMarkup:
-    """Builds inline shelf buttons so crew doesn't even need to type."""
-    buttons = []
-    
-    # Priority shelf if active
-    if active_shelf:
-        buttons.append([InlineKeyboardButton(f"✅ Keep Current Shelf: {active_shelf}", callback_data=f"shelf_pick_{active_shelf}")])
-    
-    # Common store shelves for quick 1-tap
-    buttons.append([
-        InlineKeyboardButton("G101", callback_data="shelf_pick_G101"),
-        InlineKeyboardButton("G102", callback_data="shelf_pick_G102"),
-        InlineKeyboardButton("G103", callback_data="shelf_pick_G103"),
-        InlineKeyboardButton("G104", callback_data="shelf_pick_G104"),
-    ])
-    buttons.append([
-        InlineKeyboardButton("A01", callback_data="shelf_pick_A01"),
-        InlineKeyboardButton("A02", callback_data="shelf_pick_A02"),
-        InlineKeyboardButton("B01", callback_data="shelf_pick_B01"),
-        InlineKeyboardButton("B02", callback_data="shelf_pick_B02"),
-    ])
-    buttons.append([
-        InlineKeyboardButton("✏️ Type Custom Shelf", callback_data="shelf_type_custom")
-    ])
-    return InlineKeyboardMarkup(buttons)
 
 
 def get_quick_qty_keyboard() -> InlineKeyboardMarkup:
@@ -142,7 +116,7 @@ def get_quick_qty_keyboard() -> InlineKeyboardMarkup:
             InlineKeyboardButton("100", callback_data="qty_100"),
         ],
         [
-            InlineKeyboardButton("✏️ Type Number", callback_data="qty_custom")
+            InlineKeyboardButton("✏️ Type Custom Number", callback_data="qty_custom")
         ]
     ])
 
@@ -593,7 +567,7 @@ def create_excel_report(counts: List[Dict[str, Any]]) -> BytesIO:
 
 
 # ---------------------------------------------------------------------------
-# 7. PARSE 1-SHOT CAPTION (Fastest way for crew)
+# 7. PARSE 1-SHOT CAPTION
 # ---------------------------------------------------------------------------
 def parse_quick_caption(caption: str, default_shelf: Optional[str] = None, detected_barcode: Optional[str] = None) -> Optional[Tuple[str, str, str, float]]:
     if not caption or not caption.strip():
@@ -619,7 +593,7 @@ def parse_quick_caption(caption: str, default_shelf: Optional[str] = None, detec
     if not tokens:
         return shelf, barcode, item_name, qty
 
-    if re.match(r"^[A-Za-z0-9\-_]{2,6}$", tokens[0]) and not tokens[0].isdigit():
+    if re.match(r"^[A-Za-z0-9\-_]{2,8}$", tokens[0]) and not tokens[0].isdigit():
         shelf = tokens[0].upper()
         tokens = tokens[1:]
 
@@ -637,7 +611,7 @@ def parse_quick_caption(caption: str, default_shelf: Optional[str] = None, detec
 
 
 # ---------------------------------------------------------------------------
-# 8. TELEGRAM HANDLERS
+# 8. TELEGRAM HANDLERS (Manual Input & Group Support)
 # ---------------------------------------------------------------------------
 def get_user_display_name(update: Update) -> str:
     user = update.effective_user
@@ -670,8 +644,9 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"👋 *Welcome to Store Stock Count Bot!*\n\n"
         f"📍 *Your Shelf:* {shelf_display}\n\n"
         f"👉 *How to count an item:*\n"
-        f"1️⃣ **Send a photo of the item** 📸\n"
-        f"2️⃣ Tap the buttons on your screen to pick Shelf & QTY!\n\n"
+        f"1️⃣ **Just send a photo of the item** 📸\n"
+        f"2️⃣ Type your Shelf (e.g. `G101`)\n"
+        f"3️⃣ Confirm/Type Barcode & QTY!\n\n"
         f"💡 *Super Fast Pro Tip:*\n"
         f"Send photo with caption: `G101 8850123456789 Coke 12`\n"
         f"*(It will save instantly in 1 second!)*"
@@ -689,11 +664,22 @@ async def handle_text_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE
     if text == "📸 Count New Item":
         await update.message.reply_text("📸 Please send a photo of the product front:", parse_mode="Markdown")
     elif text == "📍 Set Shelf":
-        await update.message.reply_text("📍 Please select or type your **Shelf Code**:", reply_markup=get_shelf_keyboard(), parse_mode="Markdown")
+        await update.message.reply_text("📍 Please type your **Shelf Code** (e.g. `G101`, `A12`, `B05`):", parse_mode="Markdown")
+        context.user_data["waiting_shelf_direct"] = True
     elif text == "📊 Export Excel":
         await cmd_export(update, context)
     elif text == "📈 View Stats":
         await cmd_stats(update, context)
+    elif context.user_data.get("waiting_shelf_direct"):
+        context.user_data["waiting_shelf_direct"] = False
+        shelf = text.upper()
+        if update.effective_user:
+            await db_set_user_active_shelf(update.effective_user.id, shelf)
+        await update.message.reply_text(
+            f"✅ *Active shelf set to:* `{shelf}`\n\nAll next items will use `{shelf}` automatically! Send a photo now to count.",
+            reply_markup=get_main_reply_keyboard(),
+            parse_mode="Markdown"
+        )
 
 
 async def cmd_export(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -742,7 +728,7 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ---------------------------------------------------------------------------
-# 9. PHOTO FLOW (Works with Interactive Buttons)
+# 9. PHOTO FLOW (Pure Manual Typing + Fast Smart Defaults)
 # ---------------------------------------------------------------------------
 async def handle_incoming_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data.clear()
@@ -825,12 +811,22 @@ async def prompt_shelf_step(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     active_shelf = await db_get_user_active_shelf(user.id) if user else None
     target = update.callback_query.message if update.callback_query else update.message
 
-    keyboard = get_shelf_keyboard(active_shelf)
-    await target.reply_text(
-        "📍 *Step 2/4: Pick Shelf Location:*\n\nTap your shelf button below (or type custom code):",
-        reply_markup=keyboard,
-        parse_mode="Markdown"
-    )
+    if active_shelf:
+        # Give 1-tap button to keep current shelf OR simply type any shelf code
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton(f"✅ Keep Current Shelf: {active_shelf}", callback_data=f"shelf_keep_{active_shelf}")]
+        ])
+        await target.reply_text(
+            f"📍 *Please type the Shelf Code* (e.g. `G101`, `A12`, `B05`):\n\n"
+            f"_(Or tap below to keep `{active_shelf}`):_",
+            reply_markup=kb,
+            parse_mode="Markdown"
+        )
+    else:
+        await target.reply_text(
+            "📍 *Please type the Shelf Code* (e.g. `G101`, `A12`, `B05`, etc.):",
+            parse_mode="Markdown"
+        )
     return STATE_SHELF
 
 
@@ -839,15 +835,10 @@ async def flow_shelf_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     await query.answer()
     data = query.data
 
-    if data.startswith("shelf_pick_"):
-        shelf = data.replace("shelf_pick_", "").strip().upper()
+    if data.startswith("shelf_keep_"):
+        shelf = data.replace("shelf_keep_", "").strip().upper()
         context.user_data["shelf"] = shelf
-        if update.effective_user:
-            await db_set_user_active_shelf(update.effective_user.id, shelf)
         return await prompt_barcode_step(update, context)
-    elif data == "shelf_type_custom":
-        await query.message.reply_text("📍 Please type the **Shelf Code** (e.g. `G101` or `A05`):", parse_mode="Markdown")
-        return STATE_SHELF
 
     return STATE_SHELF
 
@@ -855,7 +846,7 @@ async def flow_shelf_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
 async def flow_shelf_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     shelf = update.message.text.strip().upper()
     if not shelf:
-        await update.message.reply_text("⚠️ Type e.g. `G101`:")
+        await update.message.reply_text("⚠️ Please type the Shelf Code (e.g. `G101`):")
         return STATE_SHELF
     context.user_data["shelf"] = shelf
     if update.effective_user:
@@ -873,11 +864,10 @@ async def prompt_barcode_step(update: Update, context: ContextTypes.DEFAULT_TYPE
         ])
         await target.reply_text(f"🏷️ *Barcode Detected:* `{detected}`\nTap to confirm or type manually:", reply_markup=kb, parse_mode="Markdown")
     else:
-        # Fallback quick skip or type
         kb = InlineKeyboardMarkup([
             [InlineKeyboardButton("⏩ Skip Barcode Number", callback_data="skip_barcode_num")]
         ])
-        await target.reply_text("🏷️ Please type the **Barcode numbers** from the label:\n_(Or tap Skip below)_", reply_markup=kb, parse_mode="Markdown")
+        await target.reply_text("🏷️ Please type the **Barcode numbers** from the label:\n_(Or tap Skip):_", reply_markup=kb, parse_mode="Markdown")
     return STATE_BARCODE
 
 
@@ -930,7 +920,7 @@ async def flow_item_name_text(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 async def prompt_qty_step(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     target = update.callback_query.message if update.callback_query else update.message
-    await target.reply_text("🔢 *Select Quantity (QTY):*", reply_markup=get_quick_qty_keyboard(), parse_mode="Markdown")
+    await target.reply_text("🔢 *Select or Type Quantity (QTY):*", reply_markup=get_quick_qty_keyboard(), parse_mode="Markdown")
     return STATE_QTY
 
 
@@ -1063,7 +1053,7 @@ async def main_async():
                 CommandHandler("cancel", flow_cancel)
             ],
             STATE_SHELF: [
-                CallbackQueryHandler(flow_shelf_callback, pattern="^(shelf_pick_|shelf_type_custom)"),
+                CallbackQueryHandler(flow_shelf_callback, pattern="^shelf_keep_"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, flow_shelf_text),
                 CommandHandler("cancel", flow_cancel)
             ],
