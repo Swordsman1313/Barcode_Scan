@@ -1,11 +1,11 @@
 """
 =============================================================================
-STORE STOCK COUNT TELEGRAM BOT — RENDER RESILIENT EDITION
+STORE STOCK COUNT TELEGRAM BOT — GROUP INTERACTIVE BUTTON EDITION
 =============================================================================
-- Web health check server runs immediately on $PORT for Render $0 Free Web Service
-- Safe environment token checking (no crash on missing token)
-- Safe barcode decoding with zxing-cpp fallback
-- Big touch buttons & group chat support
+- Interactive Inline Buttons for Shelves (G101, G102, etc.) — 100% works in groups
+- Auto barcode scanner from photos (zxing-cpp)
+- 1-Tap Quantity buttons
+- Full support for Group Privacy Mode
 =============================================================================
 """
 
@@ -24,7 +24,6 @@ from typing import Optional, List, Dict, Any, Tuple
 from dotenv import load_dotenv
 from PIL import Image, ImageEnhance, ImageOps
 
-# Safe import for zxingcpp
 try:
     import zxingcpp
     HAS_ZXING = True
@@ -75,7 +74,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger("StockBot")
 
-# Conversation States
 (
     STATE_BARCODE_PHOTO,
     STATE_SHELF,
@@ -86,10 +84,9 @@ logger = logging.getLogger("StockBot")
 
 
 # ---------------------------------------------------------------------------
-# 2. PERMANENT BUTTON KEYBOARD (Zero Commands Needed)
+# 2. KEYBOARDS (Interactive for Groups & Private)
 # ---------------------------------------------------------------------------
 def get_main_reply_keyboard() -> ReplyKeyboardMarkup:
-    """Big bottom touch buttons so crew never needs to type /commands."""
     keyboard = [
         [KeyboardButton("📸 Count New Item"), KeyboardButton("📍 Set Shelf")],
         [KeyboardButton("📊 Export Excel"), KeyboardButton("📈 View Stats")]
@@ -97,8 +94,34 @@ def get_main_reply_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
 
+def get_shelf_keyboard(active_shelf: Optional[str] = None) -> InlineKeyboardMarkup:
+    """Builds inline shelf buttons so crew doesn't even need to type."""
+    buttons = []
+    
+    # Priority shelf if active
+    if active_shelf:
+        buttons.append([InlineKeyboardButton(f"✅ Keep Current Shelf: {active_shelf}", callback_data=f"shelf_pick_{active_shelf}")])
+    
+    # Common store shelves for quick 1-tap
+    buttons.append([
+        InlineKeyboardButton("G101", callback_data="shelf_pick_G101"),
+        InlineKeyboardButton("G102", callback_data="shelf_pick_G102"),
+        InlineKeyboardButton("G103", callback_data="shelf_pick_G103"),
+        InlineKeyboardButton("G104", callback_data="shelf_pick_G104"),
+    ])
+    buttons.append([
+        InlineKeyboardButton("A01", callback_data="shelf_pick_A01"),
+        InlineKeyboardButton("A02", callback_data="shelf_pick_A02"),
+        InlineKeyboardButton("B01", callback_data="shelf_pick_B01"),
+        InlineKeyboardButton("B02", callback_data="shelf_pick_B02"),
+    ])
+    buttons.append([
+        InlineKeyboardButton("✏️ Type Custom Shelf", callback_data="shelf_type_custom")
+    ])
+    return InlineKeyboardMarkup(buttons)
+
+
 def get_quick_qty_keyboard() -> InlineKeyboardMarkup:
-    """1-tap quantity buttons."""
     return InlineKeyboardMarkup([
         [
             InlineKeyboardButton("1", callback_data="qty_1"),
@@ -245,19 +268,6 @@ async def db_get_all_counts() -> List[Dict[str, Any]]:
             return [dict(r) for r in rows]
 
 
-async def db_get_recent_counts(user_id: Optional[int] = None, limit: int = 8) -> List[Dict[str, Any]]:
-    async with get_db() as db:
-        if user_id:
-            query = "SELECT * FROM counts WHERE user_id = ? ORDER BY id DESC LIMIT ?"
-            params = (user_id, limit)
-        else:
-            query = "SELECT * FROM counts ORDER BY id DESC LIMIT ?"
-            params = (limit,)
-        async with db.execute(query, params) as cursor:
-            rows = await cursor.fetchall()
-            return [dict(r) for r in rows]
-
-
 async def db_mark_synced(count_ids: List[int]):
     if not count_ids:
         return
@@ -332,7 +342,7 @@ def detect_barcode_from_image(image_path: str) -> Optional[str]:
                     if r.text and r.text.strip():
                         return r.text.strip()
     except Exception as e:
-        logger.warning(f"Barcode detection error on {image_path}: {e}")
+        logger.warning(f"Barcode detection error: {e}")
     return None
 
 
@@ -405,18 +415,6 @@ class SheetsSyncManager:
                 logger.error(f"Sync queue error: {e}")
                 await asyncio.sleep(1)
 
-    async def sync_pending_records(self) -> int:
-        if not self.webhook_url:
-            return 0
-        pending = await db_get_unsynced_counts(limit=100)
-        synced_ids = []
-        for item in pending:
-            if await self._send(item):
-                synced_ids.append(item["id"])
-        if synced_ids:
-            await db_mark_synced(synced_ids)
-        return len(synced_ids)
-
 
 sync_manager = SheetsSyncManager()
 
@@ -437,7 +435,6 @@ def create_excel_report(counts: List[Dict[str, Any]]) -> BytesIO:
     THIN_BORDER = Border(left=Side(style="thin", color="CBD5E1"), right=Side(style="thin", color="CBD5E1"), top=Side(style="thin", color="CBD5E1"), bottom=Side(style="thin", color="CBD5E1"))
     DOUBLE_BOTTOM = Border(left=Side(style="thin", color="CBD5E1"), right=Side(style="thin", color="CBD5E1"), top=Side(style="thin", color="CBD5E1"), bottom=Side(style="double", color="1E293B"))
 
-    # Tab 1: Stock Items
     ws = wb.active
     ws.title = "Stock Items"
     ws.views.sheetView[0].showGridLines = True
@@ -468,7 +465,6 @@ def create_excel_report(counts: List[Dict[str, Any]]) -> BytesIO:
         c4 = ws.cell(row=row_num, column=4, value=str(item.get("shelf", "")).upper())
         c4.font = BOLD_FONT
 
-        # Barcode formatted strictly as text string (@) to prevent scientific notation
         c5 = ws.cell(row=row_num, column=5, value=str(item.get("barcode", "")))
         c5.number_format = "@"
         c5.font = BOLD_FONT
@@ -584,7 +580,6 @@ def create_excel_report(counts: List[Dict[str, Any]]) -> BytesIO:
             ws_crew.cell(row=c_row, column=col).border = THIN_BORDER
         c_row += 1
 
-    # Auto column width
     for worksheet in [ws, ws_shelf, ws_crew]:
         for col in worksheet.columns:
             max_len = max((len(str(cell.value or "")) for cell in col if cell.row > 1), default=10)
@@ -675,7 +670,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"👋 *Welcome to Store Stock Count Bot!*\n\n"
         f"📍 *Your Shelf:* {shelf_display}\n\n"
         f"👉 *How to count an item:*\n"
-        f"1️⃣ **Just send a photo of the item** 📸\n"
+        f"1️⃣ **Send a photo of the item** 📸\n"
         f"2️⃣ Tap the buttons on your screen to pick Shelf & QTY!\n\n"
         f"💡 *Super Fast Pro Tip:*\n"
         f"Send photo with caption: `G101 8850123456789 Coke 12`\n"
@@ -694,22 +689,11 @@ async def handle_text_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE
     if text == "📸 Count New Item":
         await update.message.reply_text("📸 Please send a photo of the product front:", parse_mode="Markdown")
     elif text == "📍 Set Shelf":
-        await update.message.reply_text("📍 Please type your **Shelf Code** (e.g. `G101`):", parse_mode="Markdown")
-        context.user_data["waiting_shelf_direct"] = True
+        await update.message.reply_text("📍 Please select or type your **Shelf Code**:", reply_markup=get_shelf_keyboard(), parse_mode="Markdown")
     elif text == "📊 Export Excel":
         await cmd_export(update, context)
     elif text == "📈 View Stats":
         await cmd_stats(update, context)
-    elif context.user_data.get("waiting_shelf_direct"):
-        context.user_data["waiting_shelf_direct"] = False
-        shelf = text.upper()
-        if update.effective_user:
-            await db_set_user_active_shelf(update.effective_user.id, shelf)
-        await update.message.reply_text(
-            f"✅ *Shelf locked to:* `{shelf}`\n\nAll next items will use `{shelf}` automatically! Send a photo now to count.",
-            reply_markup=get_main_reply_keyboard(),
-            parse_mode="Markdown"
-        )
 
 
 async def cmd_export(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -758,7 +742,7 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ---------------------------------------------------------------------------
-# 9. PHOTO FLOW
+# 9. PHOTO FLOW (Works with Interactive Buttons)
 # ---------------------------------------------------------------------------
 async def handle_incoming_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data.clear()
@@ -841,27 +825,30 @@ async def prompt_shelf_step(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     active_shelf = await db_get_user_active_shelf(user.id) if user else None
     target = update.callback_query.message if update.callback_query else update.message
 
-    if active_shelf:
-        kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton(f"✅ Keep Shelf {active_shelf}", callback_data=f"keep_shelf_{active_shelf}")],
-            [InlineKeyboardButton("✏️ Enter Different Shelf", callback_data="change_shelf")]
-        ])
-        await target.reply_text(f"📍 *Shelf:* `{active_shelf}`\nTap to keep or type a new one:", reply_markup=kb, parse_mode="Markdown")
-    else:
-        await target.reply_text("📍 Please type the **Shelf Code** (e.g. `G101`):", parse_mode="Markdown")
+    keyboard = get_shelf_keyboard(active_shelf)
+    await target.reply_text(
+        "📍 *Step 2/4: Pick Shelf Location:*\n\nTap your shelf button below (or type custom code):",
+        reply_markup=keyboard,
+        parse_mode="Markdown"
+    )
     return STATE_SHELF
 
 
 async def flow_shelf_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
-    if query.data.startswith("keep_shelf_"):
-        shelf = query.data.replace("keep_shelf_", "").strip().upper()
+    data = query.data
+
+    if data.startswith("shelf_pick_"):
+        shelf = data.replace("shelf_pick_", "").strip().upper()
         context.user_data["shelf"] = shelf
+        if update.effective_user:
+            await db_set_user_active_shelf(update.effective_user.id, shelf)
         return await prompt_barcode_step(update, context)
-    elif query.data == "change_shelf":
-        await query.message.reply_text("📍 Please type the new **Shelf Code** (e.g. `G102`):", parse_mode="Markdown")
+    elif data == "shelf_type_custom":
+        await query.message.reply_text("📍 Please type the **Shelf Code** (e.g. `G101` or `A05`):", parse_mode="Markdown")
         return STATE_SHELF
+
     return STATE_SHELF
 
 
@@ -884,19 +871,28 @@ async def prompt_barcode_step(update: Update, context: ContextTypes.DEFAULT_TYPE
             [InlineKeyboardButton(f"✅ Confirm Barcode: {detected}", callback_data=f"confirm_barcode_{detected}")],
             [InlineKeyboardButton("✏️ Type Different Barcode", callback_data="type_barcode")]
         ])
-        await target.reply_text(f"🏷️ *Barcode:* `{detected}`\nTap to confirm or type manually:", reply_markup=kb, parse_mode="Markdown")
+        await target.reply_text(f"🏷️ *Barcode Detected:* `{detected}`\nTap to confirm or type manually:", reply_markup=kb, parse_mode="Markdown")
     else:
-        await target.reply_text("🏷️ Please type the **Barcode number** from the label:", parse_mode="Markdown")
+        # Fallback quick skip or type
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("⏩ Skip Barcode Number", callback_data="skip_barcode_num")]
+        ])
+        await target.reply_text("🏷️ Please type the **Barcode numbers** from the label:\n_(Or tap Skip below)_", reply_markup=kb, parse_mode="Markdown")
     return STATE_BARCODE
 
 
 async def flow_barcode_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
-    if query.data.startswith("confirm_barcode_"):
-        context.user_data["barcode"] = query.data.replace("confirm_barcode_", "").strip()
+    data = query.data
+
+    if data.startswith("confirm_barcode_"):
+        context.user_data["barcode"] = data.replace("confirm_barcode_", "").strip()
         return await prompt_item_name_step(update, context)
-    elif query.data == "type_barcode":
+    elif data == "skip_barcode_num":
+        context.user_data["barcode"] = "NO_BARCODE"
+        return await prompt_item_name_step(update, context)
+    elif data == "type_barcode":
         await query.message.reply_text("🏷️ Please type the **Barcode number**:", parse_mode="Markdown")
         return STATE_BARCODE
     return STATE_BARCODE
@@ -913,7 +909,7 @@ async def flow_barcode_text(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
 async def prompt_item_name_step(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     target = update.callback_query.message if update.callback_query else update.message
-    kb = InlineKeyboardMarkup([[InlineKeyboardButton("⏩ Skip / No Name", callback_data="skip_item_name")]])
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("⏩ Skip Product Name", callback_data="skip_item_name")]])
     await target.reply_text("📦 Type the **Product Name** (or tap Skip):", reply_markup=kb, parse_mode="Markdown")
     return STATE_ITEM_NAME
 
@@ -1031,14 +1027,13 @@ async def handle_health_check(request):
 
 
 # ---------------------------------------------------------------------------
-# 11. MAIN RUNNER (Starts Web Server & Telegram Polling Concurrently)
+# 11. MAIN RUNNER
 # ---------------------------------------------------------------------------
 async def main_async():
     logger.info("Initializing SQLite database...")
     await init_db()
     await sync_manager.start()
 
-    # 1. Start Web Health Server on PORT immediately for Render
     app_web = web.Application()
     app_web.router.add_get("/", handle_health_check)
     app_web.router.add_get("/health", handle_health_check)
@@ -1048,14 +1043,11 @@ async def main_async():
     await site.start()
     logger.info(f"🚀 Web health server listening on port {PORT}")
 
-    # 2. Check Bot Token
     if not TELEGRAM_BOT_TOKEN:
-        logger.error("❌ ERROR: TELEGRAM_BOT_TOKEN is not set in Environment Variables! Please add it in Render Dashboard.")
-        # Keep web server alive so Render health check succeeds
+        logger.error("❌ ERROR: TELEGRAM_BOT_TOKEN is not set in Environment Variables!")
         while True:
             await asyncio.sleep(3600)
 
-    # 3. Start Telegram Bot
     logger.info("🤖 Starting Telegram Bot polling...")
     tg_app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
@@ -1071,12 +1063,12 @@ async def main_async():
                 CommandHandler("cancel", flow_cancel)
             ],
             STATE_SHELF: [
-                CallbackQueryHandler(flow_shelf_callback, pattern="^(keep_shelf_|change_shelf)"),
+                CallbackQueryHandler(flow_shelf_callback, pattern="^(shelf_pick_|shelf_type_custom)"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, flow_shelf_text),
                 CommandHandler("cancel", flow_cancel)
             ],
             STATE_BARCODE: [
-                CallbackQueryHandler(flow_barcode_callback, pattern="^(confirm_barcode_|type_barcode)"),
+                CallbackQueryHandler(flow_barcode_callback, pattern="^(confirm_barcode_|type_barcode|skip_barcode_num)"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, flow_barcode_text),
                 CommandHandler("cancel", flow_cancel)
             ],
@@ -1108,7 +1100,6 @@ async def main_async():
     await tg_app.updater.start_polling(drop_pending_updates=True)
     logger.info("🎉 Bot is online and listening for messages!")
 
-    # Keep running forever
     try:
         while True:
             await asyncio.sleep(3600)
