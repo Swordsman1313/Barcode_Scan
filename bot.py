@@ -5,7 +5,7 @@ STORE STOCK SCAN BOT — RETAIL & RAW MATERIAL SUPPORT
 - Retail Goods: 100% Automatic AI Packaging Reader & Barcode Decoder
 - Raw Materials: Easily type manual Item Name & Skip Barcodes
 - Dual HD Photos: Pushes both Front Photo & Barcode Photo to Google Sheets
-- Works with photos in ANY order
+- Works in Direct Chats & Telegram Groups (allow_reentry & file support)
 - Clickable Full HD images in Google Sheets
 =============================================================================
 """
@@ -498,6 +498,18 @@ def get_user_display_name(update: Update) -> str:
     return full_name or f"User_{user.id}"
 
 
+def get_photo_file_id(update: Update) -> Optional[str]:
+    if update.message and update.message.photo:
+        return update.message.photo[-1].file_id
+    if update.message and update.message.document:
+        doc = update.message.document
+        if doc.mime_type and doc.mime_type.startswith("image/"):
+            return doc.file_id
+        if doc.file_name and any(doc.file_name.lower().endswith(ext) for ext in [".jpg", ".jpeg", ".png", ".webp"]):
+            return doc.file_id
+    return None
+
+
 async def save_tg_photo(file_id: str, context: ContextTypes.DEFAULT_TYPE, prefix: str = "img") -> Tuple[str, str]:
     try:
         tg_file = await context.bot.get_file(file_id)
@@ -551,8 +563,11 @@ async def handle_incoming_photo(update: Update, context: ContextTypes.DEFAULT_TY
     user = update.effective_user
     crew_name = get_user_display_name(update)
 
-    photo = update.message.photo[-1]
-    file_path, photo_url = await save_tg_photo(photo.file_id, context, prefix="p1")
+    file_id = get_photo_file_id(update)
+    if not file_id:
+        return ConversationHandler.END
+
+    file_path, photo_url = await save_tg_photo(file_id, context, prefix="p1")
     context.user_data["photo1_path"] = file_path
     context.user_data["photo1_url"] = photo_url
 
@@ -628,9 +643,9 @@ async def handle_incoming_photo(update: Update, context: ContextTypes.DEFAULT_TY
 
 
 async def flow_receive_barcode_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    if update.message and update.message.photo:
-        photo = update.message.photo[-1]
-        file_path, photo_url = await save_tg_photo(photo.file_id, context, prefix="p2")
+    file_id = get_photo_file_id(update)
+    if file_id:
+        file_path, photo_url = await save_tg_photo(file_id, context, prefix="p2")
         
         # Check both barcode and name on Photo 2 as well
         detected_barcode, detected_name = await asyncio.gather(
@@ -818,8 +833,12 @@ async def finalize_and_save_count(update: Update, context: ContextTypes.DEFAULT_
 
 async def flow_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data.clear()
-    await update.message.reply_text("❌ Cancelled.", parse_mode="Markdown")
+    await update.message.reply_text("❌ Cancelled. Send a new photo anytime!", parse_mode="Markdown")
     return ConversationHandler.END
+
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    logger.error(f"Exception while handling an update: {context.error}", exc_info=context.error)
 
 
 # ---------------------------------------------------------------------------
@@ -864,37 +883,47 @@ async def main_async():
     logger.info("🤖 Starting Telegram Bot polling...")
     tg_app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
+    photo_filter = filters.PHOTO | (filters.Document.IMAGE & ~filters.COMMAND)
+
     conv = ConversationHandler(
         entry_points=[
-            MessageHandler(filters.PHOTO, handle_incoming_photo),
+            MessageHandler(photo_filter, handle_incoming_photo),
             CommandHandler("count", lambda u, c: u.message.reply_text("📸 Send a photo of the product front:"))
         ],
         states={
             STATE_BARCODE_PHOTO: [
-                MessageHandler(filters.PHOTO, flow_receive_barcode_photo),
+                MessageHandler(photo_filter, flow_receive_barcode_photo),
                 CallbackQueryHandler(flow_skip_barcode_photo_cb, pattern="^skip_barcode_photo$"),
                 CommandHandler("cancel", flow_cancel)
             ],
             STATE_SHELF: [
+                MessageHandler(photo_filter, handle_incoming_photo),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, flow_shelf_text),
                 CommandHandler("cancel", flow_cancel)
             ],
             STATE_BARCODE: [
+                MessageHandler(photo_filter, handle_incoming_photo),
                 CallbackQueryHandler(flow_barcode_callback, pattern="^skip_barcode_num$"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, flow_barcode_text),
                 CommandHandler("cancel", flow_cancel)
             ],
             STATE_ITEM_NAME: [
+                MessageHandler(photo_filter, handle_incoming_photo),
                 CallbackQueryHandler(flow_item_name_callback, pattern="^skip_item_name$"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, flow_item_name_text),
                 CommandHandler("cancel", flow_cancel)
             ],
             STATE_QTY: [
+                MessageHandler(photo_filter, handle_incoming_photo),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, flow_qty_text),
                 CommandHandler("cancel", flow_cancel)
             ]
         },
-        fallbacks=[CommandHandler("cancel", flow_cancel)],
+        fallbacks=[
+            CommandHandler("cancel", flow_cancel),
+            MessageHandler(photo_filter, handle_incoming_photo)
+        ],
+        allow_reentry=True,
         per_user=True,
         per_chat=True
     )
@@ -903,6 +932,7 @@ async def main_async():
     tg_app.add_handler(CommandHandler("start", cmd_start))
     tg_app.add_handler(CommandHandler("help", cmd_start))
     tg_app.add_handler(CommandHandler("testai", cmd_testai))
+    tg_app.add_error_handler(error_handler)
 
     await tg_app.initialize()
     await tg_app.start()
