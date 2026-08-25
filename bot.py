@@ -1,12 +1,13 @@
 """
 =============================================================================
-STORE STOCK SCAN BOT — RETAIL & RAW MATERIAL SUPPORT
+STORE STOCK SCAN BOT — MULTI-USER GROUP & RAW MATERIAL SUPPORT
 =============================================================================
-- Retail Goods: 100% Automatic AI Packaging Reader & Barcode Decoder
-- Raw Materials: Easily type manual Item Name & Skip Barcodes
-- Dual HD Photos: Pushes both Front Photo & Barcode Photo to Google Sheets
-- Works in Direct Chats & Telegram Groups (allow_reentry & file support)
-- Clickable Full HD images in Google Sheets
+- Full Multi-User Group Isolation (Each user has their own independent scan session)
+- Direct Message Replies (Replies directly to the user's photo/text to avoid confusion)
+- Fast 1-Shot Caption Support (e.g. caption photo with "G101 15" for instant save)
+- Retail Goods: AI Packaging Reader & Barcode Scanner
+- Raw Materials: Easy manual name entry & skip barcode
+- Dual HD Photos: Pushes both Front & Barcode photos to Google Sheets
 =============================================================================
 """
 
@@ -510,6 +511,24 @@ def get_photo_file_id(update: Update) -> Optional[str]:
     return None
 
 
+async def safe_reply(update: Update, text: str, reply_markup=None) -> Any:
+    """Helper to always reply directly to the specific user's message in groups."""
+    target = update.callback_query.message if update.callback_query else update.message
+    if not target:
+        return None
+    try:
+        user_tag = f"👤 *{get_user_display_name(update)}:*\n"
+        full_text = f"{user_tag}{text}"
+        return await target.reply_text(
+            full_text,
+            reply_markup=reply_markup,
+            parse_mode="Markdown"
+        )
+    except Exception as e:
+        logger.warning(f"Reply error: {e}")
+        return await target.reply_text(text, reply_markup=reply_markup, parse_mode="Markdown")
+
+
 async def save_tg_photo(file_id: str, context: ContextTypes.DEFAULT_TYPE, prefix: str = "img") -> Tuple[str, str]:
     try:
         tg_file = await context.bot.get_file(file_id)
@@ -540,19 +559,16 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"2️⃣ Send the barcode photo (or tap Skip)\n"
         f"3️⃣ Type Shelf (e.g. `G101`, `RM-01`)\n"
         f"4️⃣ Type Quantity (e.g. `12`)\n\n"
-        f"⚡ *Auto-reads packaging names or lets you type raw material names easily!*"
+        f"⚡ *Tip: In busy groups, caption your photo with `Shelf QTY` (e.g. `G101 10`) for instant 1-shot save!*"
     )
-    await update.message.reply_text(
-        msg,
-        reply_markup=ReplyKeyboardRemove(),
-        parse_mode="Markdown"
-    )
+    await safe_reply(update, msg, reply_markup=ReplyKeyboardRemove())
 
 
 async def cmd_testai(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = await update.message.reply_text("⏳ *Testing Gemini AI Vision API connection...*", parse_mode="Markdown")
+    msg = await safe_reply(update, "⏳ *Testing Gemini AI Vision API connection...*")
     report = await test_gemini_api_connection()
-    await msg.edit_text(report, parse_mode="Markdown")
+    if msg:
+        await msg.edit_text(report, parse_mode="Markdown")
 
 
 # ---------------------------------------------------------------------------
@@ -613,18 +629,19 @@ async def handle_incoming_photo(update: Update, context: ContextTypes.DEFAULT_TY
         sync_manager.enqueue(record)
         qty_display = int(qty) if qty.is_integer() else qty
 
-        await update.message.reply_text(
+        await safe_reply(
+            update,
             f"⚡ *SAVED TO GOOGLE SHEET!*\n"
             f"━━━━━━━━━━━━━━━━━━━━━━\n"
             f"📍 *Shelf:* `{shelf}`\n"
             f"🏷️ *Barcode:* `{barcode}`\n"
             f"📦 *Item:* {name}\n"
             f"🔢 *Quantity:* `{qty_display}`\n"
-            f"👤 *Crew:* {crew_name}\n"
+            f"🕒 *Time:* `{record['timestamp']}`\n"
             f"━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"👉 *Send next photo to continue!*",
-            parse_mode="Markdown"
+            f"👉 *Send next photo to continue!*"
         )
+        context.user_data.clear()
         return ConversationHandler.END
 
     name_status = f"\n📦 *Item:* `{detected_name}` (Auto-detected ✨)" if detected_name else ""
@@ -633,11 +650,11 @@ async def handle_incoming_photo(update: Update, context: ContextTypes.DEFAULT_TY
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("⏩ Skip (No Barcode / Raw Material)", callback_data="skip_barcode_photo")]
     ])
-    await update.message.reply_text(
+    await safe_reply(
+        update,
         f"📸 *Photo 1 Received!*{name_status}{barcode_status}\n\n"
         f"📷 Send **Photo 2 (Barcode label)**\n_(Or tap Skip if Raw Material / Done):_",
-        reply_markup=kb,
-        parse_mode="Markdown"
+        reply_markup=kb
     )
     return STATE_BARCODE_PHOTO
 
@@ -647,7 +664,6 @@ async def flow_receive_barcode_photo(update: Update, context: ContextTypes.DEFAU
     if file_id:
         file_path, photo_url = await save_tg_photo(file_id, context, prefix="p2")
         
-        # Check both barcode and name on Photo 2 as well
         detected_barcode, detected_name = await asyncio.gather(
             asyncio.to_thread(detect_barcode_from_image, file_path),
             extract_product_name_from_image(file_path) if not context.user_data.get("item_name") else asyncio.sleep(0)
@@ -677,10 +693,9 @@ async def flow_skip_barcode_photo_cb(update: Update, context: ContextTypes.DEFAU
 
 
 async def prompt_shelf_step(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    target = update.callback_query.message if update.callback_query else update.message
-    await target.reply_text(
-        "📍 *Please type the Shelf Code* (e.g. `G101`, `RM-01`, `A12`):",
-        parse_mode="Markdown"
+    await safe_reply(
+        update,
+        "📍 *Please type the Shelf Code* (e.g. `G101`, `RM-01`, `A12`):"
     )
     return STATE_SHELF
 
@@ -688,7 +703,7 @@ async def prompt_shelf_step(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 async def flow_shelf_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     shelf = update.message.text.strip().upper()
     if not shelf:
-        await update.message.reply_text("⚠️ Please type the Shelf Code (e.g. `G101`):")
+        await safe_reply(update, "⚠️ Please type the Shelf Code (e.g. `G101`):")
         return STATE_SHELF
     context.user_data["shelf"] = shelf
     return await check_barcode_step(update, context)
@@ -696,7 +711,6 @@ async def flow_shelf_text(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 async def check_barcode_step(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     detected_barcode = context.user_data.get("detected_barcode")
-    target = update.callback_query.message if update.callback_query else update.message
 
     if detected_barcode:
         context.user_data["barcode"] = detected_barcode
@@ -705,10 +719,10 @@ async def check_barcode_step(update: Update, context: ContextTypes.DEFAULT_TYPE)
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("⏩ Skip Barcode (Raw Material / No Code)", callback_data="skip_barcode_num")]
     ])
-    await target.reply_text(
+    await safe_reply(
+        update,
         "🏷️ Type **Barcode numbers** (Or tap Skip if Raw Material):",
-        reply_markup=kb,
-        parse_mode="Markdown"
+        reply_markup=kb
     )
     return STATE_BARCODE
 
@@ -729,26 +743,23 @@ async def flow_barcode_text(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
 
 async def check_item_name_step(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    target = update.callback_query.message if update.callback_query else update.message
     current_name = context.user_data.get("item_name")
 
-    # If AI already detected a name from packaging, proceed directly to QTY
     if current_name and current_name != "-" and len(current_name.strip()) > 1:
-        await target.reply_text(
+        await safe_reply(
+            update,
             f"📦 *Item:* `{current_name}` (Auto-detected ✨)\n\n"
-            f"🔢 *Please type the Quantity (QTY):*\n_(e.g. 1, 5, 12, 24)_",
-            parse_mode="Markdown"
+            f"🔢 *Please type the Quantity (QTY):*\n_(e.g. 1, 5, 12, 24)_"
         )
         return STATE_QTY
 
-    # If NO name was detected (e.g. Raw Material / Unbranded), ask user to type name
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("⏩ Skip Name", callback_data="skip_item_name")]
     ])
-    await target.reply_text(
+    await safe_reply(
+        update,
         "📦 *Please type the Item Name:*\n_(e.g. Sugar 50kg, Raw Cashew, Flour Bag)_",
-        reply_markup=kb,
-        parse_mode="Markdown"
+        reply_markup=kb
     )
     return STATE_ITEM_NAME
 
@@ -758,7 +769,7 @@ async def flow_item_name_callback(update: Update, context: ContextTypes.DEFAULT_
     await query.answer()
     if query.data == "skip_item_name":
         context.user_data["item_name"] = "-"
-        await query.message.reply_text("🔢 *Please type the Quantity (QTY):*\n_(e.g. 1, 5, 12, 24)_", parse_mode="Markdown")
+        await safe_reply(update, "🔢 *Please type the Quantity (QTY):*\n_(e.g. 1, 5, 12, 24)_")
         return STATE_QTY
     return STATE_ITEM_NAME
 
@@ -766,7 +777,7 @@ async def flow_item_name_callback(update: Update, context: ContextTypes.DEFAULT_
 async def flow_item_name_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     name = update.message.text.strip()
     context.user_data["item_name"] = name or "-"
-    await update.message.reply_text("🔢 *Please type the Quantity (QTY):*\n_(e.g. 1, 5, 12, 24)_", parse_mode="Markdown")
+    await safe_reply(update, "🔢 *Please type the Quantity (QTY):*\n_(e.g. 1, 5, 12, 24)_")
     return STATE_QTY
 
 
@@ -775,12 +786,12 @@ async def flow_qty_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     try:
         qty = float(text)
         if qty <= 0:
-            await update.message.reply_text("⚠️ Quantity must be greater than 0. Please type a number (e.g. 12):")
+            await safe_reply(update, "⚠️ Quantity must be greater than 0. Please type a number (e.g. 12):")
             return STATE_QTY
         context.user_data["qty"] = qty
         return await finalize_and_save_count(update, context)
     except ValueError:
-        await update.message.reply_text("⚠️ Please enter a valid number (e.g. `12` or `5`):")
+        await safe_reply(update, "⚠️ Please enter a valid number (e.g. `12` or `5`):")
         return STATE_QTY
 
 
@@ -811,7 +822,6 @@ async def finalize_and_save_count(update: Update, context: ContextTypes.DEFAULT_
     )
 
     sync_manager.enqueue(record)
-    target = update.callback_query.message if update.callback_query else update.message
     qty_display = int(qty) if qty.is_integer() else qty
 
     card = (
@@ -821,24 +831,23 @@ async def finalize_and_save_count(update: Update, context: ContextTypes.DEFAULT_
         f"🏷️ *Barcode:* `{barcode}`\n"
         f"📦 *Item:* {item_name}\n"
         f"🔢 *Quantity:* `{qty_display}`\n"
-        f"👤 *Crew:* {crew_name}\n"
         f"🕒 *Time:* `{record['timestamp']}`\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
         f"👉 *Send next photo to continue!*"
     )
-    await target.reply_text(card, parse_mode="Markdown")
+    await safe_reply(update, card)
     context.user_data.clear()
     return ConversationHandler.END
 
 
 async def flow_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data.clear()
-    await update.message.reply_text("❌ Cancelled. Send a new photo anytime!", parse_mode="Markdown")
+    await safe_reply(update, "❌ Cancelled. Send a new photo anytime!")
     return ConversationHandler.END
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    logger.error(f"Exception while handling an update: {context.error}", exc_info=context.error)
+    logger.error(f"Exception while handling update: {context.error}", exc_info=context.error)
 
 
 # ---------------------------------------------------------------------------
