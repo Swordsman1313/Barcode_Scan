@@ -654,13 +654,8 @@ def assign_photos_front_and_barcode(
         context.user_data["photo_barcode_url"] = p2_url
 
 
-USER_PHOTO_LOCKS: Dict[int, asyncio.Lock] = {}
-
-
-def get_user_photo_lock(user_id: int) -> asyncio.Lock:
-    if user_id not in USER_PHOTO_LOCKS:
-        USER_PHOTO_LOCKS[user_id] = asyncio.Lock()
-    return USER_PHOTO_LOCKS[user_id]
+USER_SESSIONS: Dict[int, dict] = {}
+USER_SESSION_LOCK = asyncio.Lock()
 
 
 async def handle_incoming_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -670,263 +665,145 @@ async def handle_incoming_photo(update: Update, context: ContextTypes.DEFAULT_TY
 
     user = update.effective_user
     user_id = user.id if user else 0
-    media_group_id = message.media_group_id
-
-    if media_group_id:
-        async with MEDIA_GROUP_LOCK:
-            if media_group_id in MEDIA_GROUP_CACHE:
-                MEDIA_GROUP_CACHE[media_group_id].append(update)
-                # Return state (do NOT return None) so ConversationHandler does not trigger fallbacks
-                return STATE_BARCODE_PHOTO
-            else:
-                MEDIA_GROUP_CACHE[media_group_id] = [update]
-
-        # Wait for all photos in the album to arrive
-        await asyncio.sleep(1.2)
-
-        async with MEDIA_GROUP_LOCK:
-            album_updates = MEDIA_GROUP_CACHE.pop(media_group_id, [update])
-
-        if len(album_updates) > 1:
-            return await process_album_photos(album_updates, context)
-        else:
-            return await process_single_photo(album_updates[0], context)
-    else:
-        # Serialize per user to prevent rapid Photo 2 from racing Photo 1
-        user_lock = get_user_photo_lock(user_id)
-        async with user_lock:
-            if context.user_data.get("photo1_path") and not context.user_data.get("photo_barcode_path"):
-                return await flow_receive_barcode_photo(update, context)
-            return await process_single_photo(update, context)
-
-
-async def process_album_photos(album_updates: List[Update], context: ContextTypes.DEFAULT_TYPE) -> int:
-    context.user_data.clear()
-    first_update = album_updates[0]
-    user = first_update.effective_user
-    crew_name = get_user_display_name(first_update)
-
-    file_id_1 = get_photo_file_id(album_updates[0])
-    file_id_2 = get_photo_file_id(album_updates[1])
-
-    if not file_id_1 or not file_id_2:
-        return await process_single_photo(first_update, context)
-
-    # Download Photo 1 and Photo 2 concurrently
-    (p1_path, p1_url), (p2_path, p2_url) = await asyncio.gather(
-        save_tg_photo(file_id_1, context, prefix="p1"),
-        save_tg_photo(file_id_2, context, prefix="p2")
-    )
-
-    # Scan BOTH photos for Barcode and AI Name in parallel
-    p1_name, p2_name, p1_barcode, p2_barcode = await asyncio.gather(
-        extract_product_name_from_image(p1_path),
-        extract_product_name_from_image(p2_path),
-        asyncio.to_thread(detect_barcode_from_image, p1_path),
-        asyncio.to_thread(detect_barcode_from_image, p2_path)
-    )
-
-    detected_barcode = p2_barcode or p1_barcode
-    detected_name = None
-    if p1_name and p1_name != "-":
-        detected_name = p1_name
-    elif p2_name and p2_name != "-":
-        detected_name = p2_name
-
-    assign_photos_front_and_barcode(
-        context, p1_path, p1_url, p2_path, p2_url,
-        bool(p1_barcode), bool(p2_barcode),
-        bool(p1_name and p1_name != "-"), bool(p2_name and p2_name != "-")
-    )
-
-    if detected_name:
-        context.user_data["item_name"] = detected_name
-    else:
-        context.user_data["item_name"] = "-"
-
-    if detected_barcode:
-        context.user_data["detected_barcode"] = detected_barcode
-        context.user_data["barcode"] = detected_barcode
-
-    # Check for 1-shot caption
-    caption = ""
-    for u in album_updates:
-        if u.message and u.message.caption:
-            caption = u.message.caption.strip()
-            break
-
-    quick_data = parse_quick_caption(caption, detected_barcode=detected_barcode)
-    if quick_data:
-        shelf, barcode, name, qty = quick_data
-        if name == "-" and detected_name and detected_name != "-":
-            name = detected_name
-
-        record = await db_insert_count(
-            user_id=user.id if user else 0,
-            crew_name=crew_name,
-            shelf=shelf,
-            barcode=barcode,
-            item_name=name,
-            qty=qty,
-            photo_front=context.user_data.get("photo_front_path"),
-            photo_barcode=context.user_data.get("photo_barcode_path"),
-            photo_front_url=context.user_data.get("photo_front_url"),
-            photo_barcode_url=context.user_data.get("photo_barcode_url")
-        )
-        sync_manager.enqueue(record)
-        qty_display = int(qty) if qty.is_integer() else qty
-
-        await safe_reply(
-            first_update,
-            f"⚡ *SAVED TO GOOGLE SHEET!*\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"📍 *Shelf:* `{shelf}`\n"
-            f"🏷️ *Barcode:* `{barcode}`\n"
-            f"📦 *Item:* {name}\n"
-            f"🔢 *Quantity:* `{qty_display}`\n"
-            f"🕒 *Time:* `{record['timestamp']}`\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"👉 *Send next photo to continue!*"
-        )
-        context.user_data.clear()
-        return ConversationHandler.END
-
-    name_status = f"\n📦 *Item:* `{detected_name}` (Auto-detected ✨)" if detected_name and detected_name != "-" else ""
-    barcode_status = f"\n🏷️ *Barcode:* `{detected_barcode}`" if detected_barcode else ""
-
-    await safe_reply(
-        first_update,
-        f"📸 *2 Photos Received! (Front & Barcode)*{name_status}{barcode_status}\n\n"
-        f"📍 *Please type Shelf Code* (e.g. `G101` or `R105`):"
-    )
-    return STATE_SHELF
-
-
-async def process_single_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    context.user_data.clear()
-    user = update.effective_user
-    crew_name = get_user_display_name(update)
-
     file_id = get_photo_file_id(update)
     if not file_id:
         return ConversationHandler.END
 
-    file_path, photo_url = await save_tg_photo(file_id, context, prefix="p1")
-    context.user_data["photo1_path"] = file_path
-    context.user_data["photo1_url"] = photo_url
-    context.user_data["photo_front_path"] = file_path
-    context.user_data["photo_front_url"] = photo_url
+    # Get or create active session for this user
+    async with USER_SESSION_LOCK:
+        session = USER_SESSIONS.get(user_id)
+        now = time.time()
+        # Reset if no session, or older than 120s, or previous item was completed
+        if not session or (now - session.get("created_at", 0)) > 120 or session.get("completed"):
+            context.user_data.clear()
+            session = {
+                "created_at": now,
+                "photos": [],
+                "completed": False,
+                "lock": asyncio.Lock()
+            }
+            USER_SESSIONS[user_id] = session
 
-    # Check both barcode and name on Photo 1
-    detected_barcode, detected_name = await asyncio.gather(
-        asyncio.to_thread(detect_barcode_from_image, file_path),
-        extract_product_name_from_image(file_path)
-    )
+    # Process inside user session lock
+    async with session["lock"]:
+        idx = len(session["photos"]) + 1
+        file_path, photo_url = await save_tg_photo(file_id, context, prefix=f"p{idx}")
 
-    context.user_data["photo1_barcode"] = detected_barcode
-    context.user_data["photo1_name"] = detected_name
-
-    if detected_barcode:
-        context.user_data["detected_barcode"] = detected_barcode
-        context.user_data["barcode"] = detected_barcode
-
-    if detected_name:
-        context.user_data["item_name"] = detected_name
-
-    caption = update.message.caption or ""
-    quick_data = parse_quick_caption(caption, detected_barcode=detected_barcode)
-
-    if quick_data:
-        shelf, barcode, name, qty = quick_data
-        if name == "-" and detected_name:
-            name = detected_name
-
-        record = await db_insert_count(
-            user_id=user.id if user else 0,
-            crew_name=crew_name,
-            shelf=shelf,
-            barcode=barcode,
-            item_name=name,
-            qty=qty,
-            photo_front=file_path,
-            photo_barcode=None,
-            photo_front_url=photo_url,
-            photo_barcode_url=""
+        detected_barcode, detected_name = await asyncio.gather(
+            asyncio.to_thread(detect_barcode_from_image, file_path),
+            extract_product_name_from_image(file_path)
         )
-        sync_manager.enqueue(record)
-        qty_display = int(qty) if qty.is_integer() else qty
+
+        photo_info = {
+            "path": file_path,
+            "url": photo_url,
+            "barcode": detected_barcode,
+            "name": detected_name if detected_name and detected_name != "-" else None
+        }
+        session["photos"].append(photo_info)
+
+        # -----------------------------------------------------------------
+        # PHOTO 1
+        # -----------------------------------------------------------------
+        if len(session["photos"]) == 1:
+            context.user_data["photo1_path"] = file_path
+            context.user_data["photo1_url"] = photo_url
+            context.user_data["photo_front_path"] = file_path
+            context.user_data["photo_front_url"] = photo_url
+            if detected_barcode:
+                context.user_data["detected_barcode"] = detected_barcode
+                context.user_data["barcode"] = detected_barcode
+            if detected_name and detected_name != "-":
+                context.user_data["item_name"] = detected_name
+
+            # Check 1-shot caption
+            caption = message.caption or ""
+            quick_data = parse_quick_caption(caption, detected_barcode=detected_barcode)
+            if quick_data:
+                shelf, barcode, name, qty = quick_data
+                if name == "-" and detected_name and detected_name != "-":
+                    name = detected_name
+                record = await db_insert_count(
+                    user_id=user.id if user else 0,
+                    crew_name=get_user_display_name(update),
+                    shelf=shelf,
+                    barcode=barcode,
+                    item_name=name,
+                    qty=qty,
+                    photo_front=file_path,
+                    photo_barcode=None,
+                    photo_front_url=photo_url,
+                    photo_barcode_url=""
+                )
+                sync_manager.enqueue(record)
+                qty_display = int(qty) if qty.is_integer() else qty
+                await safe_reply(
+                    update,
+                    f"⚡ *SAVED TO GOOGLE SHEET!*\n"
+                    f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                    f"📍 *Shelf:* `{shelf}`\n"
+                    f"🏷️ *Barcode:* `{barcode}`\n"
+                    f"📦 *Item:* {name}\n"
+                    f"🔢 *Quantity:* `{qty_display}`\n"
+                    f"🕒 *Time:* `{record['timestamp']}`\n"
+                    f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                    f"👉 *Send next photo to continue!*"
+                )
+                session["completed"] = True
+                context.user_data.clear()
+                return ConversationHandler.END
+
+            # Wait 0.8s to check if Photo 2 is arriving as an album or rapid sequence
+            await asyncio.sleep(0.8)
+            if len(session["photos"]) > 1:
+                # Photo 2 arrived! Suppress Photo 1 prompt; Photo 2 will send the combined prompt!
+                return STATE_SHELF
+
+            name_status = f"\n📦 *Item:* `{detected_name}` (Auto-detected ✨)" if detected_name and detected_name != "-" else ""
+            barcode_status = f"\n🏷️ *Barcode:* `{detected_barcode}`" if detected_barcode else ""
+            kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton("⏩ Skip (No Barcode / Raw Material)", callback_data="skip_barcode_photo")]
+            ])
+            await safe_reply(
+                update,
+                f"📸 *Photo 1 Received!*{name_status}{barcode_status}\n\n"
+                f"📷 Send **Photo 2** (Or type Shelf e.g. `G101`):",
+                reply_markup=kb
+            )
+            return STATE_BARCODE_PHOTO
+
+        # -----------------------------------------------------------------
+        # PHOTO 2 (or multi-photo)
+        # -----------------------------------------------------------------
+        p1 = session["photos"][0]
+        p2 = session["photos"][1]
+
+        final_barcode = p2["barcode"] or p1["barcode"]
+        final_name = p1["name"] or p2["name"]
+
+        assign_photos_front_and_barcode(
+            context, p1["path"], p1["url"], p2["path"], p2["url"],
+            bool(p1["barcode"]), bool(p2["barcode"]),
+            bool(p1["name"]), bool(p2["name"])
+        )
+
+        if final_barcode:
+            context.user_data["detected_barcode"] = final_barcode
+            context.user_data["barcode"] = final_barcode
+        if final_name:
+            context.user_data["item_name"] = final_name
+
+        name_status = f"\n📦 *Item:* `{context.user_data.get('item_name')}` (Auto-detected ✨)" if context.user_data.get("item_name") and context.user_data.get("item_name") != "-" else ""
+        barcode_status = f"\n🏷️ *Barcode:* `{context.user_data.get('detected_barcode')}`" if context.user_data.get("detected_barcode") else ""
 
         await safe_reply(
             update,
-            f"⚡ *SAVED TO GOOGLE SHEET!*\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"📍 *Shelf:* `{shelf}`\n"
-            f"🏷️ *Barcode:* `{barcode}`\n"
-            f"📦 *Item:* {name}\n"
-            f"🔢 *Quantity:* `{qty_display}`\n"
-            f"🕒 *Time:* `{record['timestamp']}`\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"👉 *Send next photo to continue!*"
+            f"📸 *2 Photos Received! (Front & Barcode)*{name_status}{barcode_status}\n\n"
+            f"📍 *Please type Shelf Code* (e.g. `G101` or `R105`):"
         )
-        context.user_data.clear()
-        return ConversationHandler.END
-
-    name_status = f"\n📦 *Item:* `{detected_name}` (Auto-detected ✨)" if detected_name and detected_name != "-" else ""
-    barcode_status = f"\n🏷️ *Barcode:* `{detected_barcode}`" if detected_barcode else ""
-
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("⏩ Skip (No Barcode / Raw Material)", callback_data="skip_barcode_photo")]
-    ])
-    await safe_reply(
-        update,
-        f"📸 *Photo 1 Received!*{name_status}{barcode_status}\n\n"
-        f"📷 Send **Photo 2** (Or type Shelf e.g. `G101`):",
-        reply_markup=kb
-    )
-    return STATE_BARCODE_PHOTO
-
-
+        return STATE_SHELF
 async def flow_receive_barcode_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    file_id = get_photo_file_id(update)
-    if not file_id:
-        return await prompt_shelf_step(update, context)
-
-    p2_path, p2_url = await save_tg_photo(file_id, context, prefix="p2")
-    p1_path = context.user_data.get("photo1_path") or p2_path
-    p1_url = context.user_data.get("photo1_url") or p2_url
-
-    p2_barcode, p2_name = await asyncio.gather(
-        asyncio.to_thread(detect_barcode_from_image, p2_path),
-        extract_product_name_from_image(p2_path) if not context.user_data.get("item_name") else asyncio.sleep(0)
-    )
-
-    p1_barcode = context.user_data.get("photo1_barcode")
-    p1_name = context.user_data.get("photo1_name") or context.user_data.get("item_name")
-
-    final_barcode = p2_barcode or p1_barcode or context.user_data.get("detected_barcode")
-    final_name = (p2_name if isinstance(p2_name, str) and p2_name != "-" else None) or p1_name or context.user_data.get("item_name")
-
-    if final_barcode:
-        context.user_data["detected_barcode"] = final_barcode
-        context.user_data["barcode"] = final_barcode
-
-    if final_name:
-        context.user_data["item_name"] = final_name
-
-    assign_photos_front_and_barcode(
-        context, p1_path, p1_url, p2_path, p2_url,
-        bool(p1_barcode), bool(p2_barcode), bool(p1_name), bool(p2_name and isinstance(p2_name, str))
-    )
-
-    name_status = f"\n📦 *Item:* `{context.user_data.get('item_name')}`" if context.user_data.get("item_name") and context.user_data.get("item_name") != "-" else ""
-    barcode_status = f"\n🏷️ *Barcode:* `{context.user_data.get('detected_barcode')}`" if context.user_data.get("detected_barcode") else ""
-
-    await safe_reply(
-        update,
-        f"📸 *2 Photos Received! (Front & Barcode)*{name_status}{barcode_status}\n\n"
-        f"📍 *Please type Shelf Code* (e.g. `G101` or `R105`):"
-    )
-    return STATE_SHELF
+    return await handle_incoming_photo(update, context)
 
 
 async def flow_skip_barcode_photo_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
