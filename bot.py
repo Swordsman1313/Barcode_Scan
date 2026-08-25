@@ -665,12 +665,13 @@ async def handle_incoming_photo(update: Update, context: ContextTypes.DEFAULT_TY
         async with MEDIA_GROUP_LOCK:
             if media_group_id in MEDIA_GROUP_CACHE:
                 MEDIA_GROUP_CACHE[media_group_id].append(update)
-                return None
+                # Return state (do NOT return None) so ConversationHandler does not trigger fallbacks
+                return STATE_BARCODE_PHOTO
             else:
                 MEDIA_GROUP_CACHE[media_group_id] = [update]
 
         # Wait for all photos in the album to arrive
-        await asyncio.sleep(0.8)
+        await asyncio.sleep(1.2)
 
         async with MEDIA_GROUP_LOCK:
             album_updates = MEDIA_GROUP_CACHE.pop(media_group_id, [update])
@@ -713,15 +714,22 @@ async def process_album_photos(album_updates: List[Update], context: ContextType
     )
 
     detected_barcode = p2_barcode or p1_barcode
-    detected_name = p1_name or p2_name or "-"
+    detected_name = None
+    if p1_name and p1_name != "-":
+        detected_name = p1_name
+    elif p2_name and p2_name != "-":
+        detected_name = p2_name
 
     assign_photos_front_and_barcode(
         context, p1_path, p1_url, p2_path, p2_url,
-        bool(p1_barcode), bool(p2_barcode), bool(p1_name), bool(p2_name)
+        bool(p1_barcode), bool(p2_barcode),
+        bool(p1_name and p1_name != "-"), bool(p2_name and p2_name != "-")
     )
 
-    if detected_name and detected_name != "-":
+    if detected_name:
         context.user_data["item_name"] = detected_name
+    else:
+        context.user_data["item_name"] = "-"
 
     if detected_barcode:
         context.user_data["detected_barcode"] = detected_barcode
@@ -1200,8 +1208,7 @@ async def main_async():
             ]
         },
         fallbacks=[
-            CommandHandler("cancel", flow_cancel),
-            MessageHandler(photo_filter, handle_incoming_photo)
+            CommandHandler("cancel", flow_cancel)
         ],
         allow_reentry=True,
         per_user=True,
