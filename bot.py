@@ -624,6 +624,36 @@ MEDIA_GROUP_CACHE: Dict[str, List[Update]] = {}
 MEDIA_GROUP_LOCK = asyncio.Lock()
 
 
+def assign_photos_front_and_barcode(
+    context: ContextTypes.DEFAULT_TYPE,
+    p1_path: str, p1_url: str,
+    p2_path: str, p2_url: str,
+    p1_has_barcode: bool, p2_has_barcode: bool,
+    p1_has_name: bool, p2_has_name: bool
+):
+    """Accurately places the front packaging photo in Front column and barcode in Barcode column."""
+    if p1_has_barcode and not p2_has_barcode:
+        context.user_data["photo_barcode_path"] = p1_path
+        context.user_data["photo_barcode_url"] = p1_url
+        context.user_data["photo_front_path"] = p2_path
+        context.user_data["photo_front_url"] = p2_url
+    elif p2_has_barcode and not p1_has_barcode:
+        context.user_data["photo_barcode_path"] = p2_path
+        context.user_data["photo_barcode_url"] = p2_url
+        context.user_data["photo_front_path"] = p1_path
+        context.user_data["photo_front_url"] = p1_url
+    elif p2_has_name and not p1_has_name:
+        context.user_data["photo_front_path"] = p2_path
+        context.user_data["photo_front_url"] = p2_url
+        context.user_data["photo_barcode_path"] = p1_path
+        context.user_data["photo_barcode_url"] = p1_url
+    else:
+        context.user_data["photo_front_path"] = p1_path
+        context.user_data["photo_front_url"] = p1_url
+        context.user_data["photo_barcode_path"] = p2_path
+        context.user_data["photo_barcode_url"] = p2_url
+
+
 async def handle_incoming_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     message = update.message
     if not message:
@@ -650,6 +680,9 @@ async def handle_incoming_photo(update: Update, context: ContextTypes.DEFAULT_TY
         else:
             return await process_single_photo(album_updates[0], context)
     else:
+        # Check if user is sending a 2nd photo in existing session
+        if context.user_data.get("photo1_path") and not context.user_data.get("photo_barcode_path"):
+            return await flow_receive_barcode_photo(update, context)
         return await process_single_photo(update, context)
 
 
@@ -665,36 +698,36 @@ async def process_album_photos(album_updates: List[Update], context: ContextType
     if not file_id_1 or not file_id_2:
         return await process_single_photo(first_update, context)
 
-    # Download Photo 1 (Front) and Photo 2 (Barcode) concurrently
+    # Download Photo 1 and Photo 2 concurrently
     (p1_path, p1_url), (p2_path, p2_url) = await asyncio.gather(
         save_tg_photo(file_id_1, context, prefix="p1"),
         save_tg_photo(file_id_2, context, prefix="p2")
     )
 
-    # Photo 1 is Front -> Extract AI Item Name
-    # Photo 2 is Barcode -> Detect Barcode (fallback to Photo 1 if not found on Photo 2)
-    detected_name, detected_barcode_p2 = await asyncio.gather(
+    # Scan BOTH photos for Barcode and AI Name in parallel
+    p1_name, p2_name, p1_barcode, p2_barcode = await asyncio.gather(
         extract_product_name_from_image(p1_path),
+        extract_product_name_from_image(p2_path),
+        asyncio.to_thread(detect_barcode_from_image, p1_path),
         asyncio.to_thread(detect_barcode_from_image, p2_path)
     )
 
-    detected_barcode = detected_barcode_p2
-    if not detected_barcode:
-        detected_barcode = await asyncio.to_thread(detect_barcode_from_image, p1_path)
+    detected_barcode = p2_barcode or p1_barcode
+    detected_name = p1_name or p2_name or "-"
 
-    context.user_data["photo_front_path"] = p1_path
-    context.user_data["photo_front_url"] = p1_url
-    context.user_data["photo_barcode_path"] = p2_path
-    context.user_data["photo_barcode_url"] = p2_url
+    assign_photos_front_and_barcode(
+        context, p1_path, p1_url, p2_path, p2_url,
+        bool(p1_barcode), bool(p2_barcode), bool(p1_name), bool(p2_name)
+    )
 
-    if detected_name:
+    if detected_name and detected_name != "-":
         context.user_data["item_name"] = detected_name
 
     if detected_barcode:
         context.user_data["detected_barcode"] = detected_barcode
         context.user_data["barcode"] = detected_barcode
 
-    # Check for fast 1-shot caption on Photo 1 or Photo 2 (e.g. "R105 2" or "G101 12")
+    # Check for 1-shot caption
     caption = ""
     for u in album_updates:
         if u.message and u.message.caption:
@@ -704,7 +737,7 @@ async def process_album_photos(album_updates: List[Update], context: ContextType
     quick_data = parse_quick_caption(caption, detected_barcode=detected_barcode)
     if quick_data:
         shelf, barcode, name, qty = quick_data
-        if name == "-" and detected_name:
+        if name == "-" and detected_name and detected_name != "-":
             name = detected_name
 
         record = await db_insert_count(
@@ -714,10 +747,10 @@ async def process_album_photos(album_updates: List[Update], context: ContextType
             barcode=barcode,
             item_name=name,
             qty=qty,
-            photo_front=p1_path,
-            photo_barcode=p2_path,
-            photo_front_url=p1_url,
-            photo_barcode_url=p2_url
+            photo_front=context.user_data.get("photo_front_path"),
+            photo_barcode=context.user_data.get("photo_barcode_path"),
+            photo_front_url=context.user_data.get("photo_front_url"),
+            photo_barcode_url=context.user_data.get("photo_barcode_url")
         )
         sync_manager.enqueue(record)
         qty_display = int(qty) if qty.is_integer() else qty
@@ -737,13 +770,13 @@ async def process_album_photos(album_updates: List[Update], context: ContextType
         context.user_data.clear()
         return ConversationHandler.END
 
-    name_status = f"\n📦 *Item:* `{detected_name}` (Auto-detected ✨)" if detected_name else ""
+    name_status = f"\n📦 *Item:* `{detected_name}` (Auto-detected ✨)" if detected_name and detected_name != "-" else ""
     barcode_status = f"\n🏷️ *Barcode:* `{detected_barcode}`" if detected_barcode else ""
 
     await safe_reply(
         first_update,
         f"📸 *2 Photos Received! (Front & Barcode)*{name_status}{barcode_status}\n\n"
-        f"📍 *Please send Shelf & Quantity* (e.g. `R105 2` or `G101 12`):"
+        f"📍 *Please type Shelf Code* (e.g. `G101` or `R105`):"
     )
     return STATE_SHELF
 
@@ -769,6 +802,9 @@ async def process_single_photo(update: Update, context: ContextTypes.DEFAULT_TYP
         extract_product_name_from_image(file_path)
     )
 
+    context.user_data["photo1_barcode"] = detected_barcode
+    context.user_data["photo1_name"] = detected_name
+
     if detected_barcode:
         context.user_data["detected_barcode"] = detected_barcode
         context.user_data["barcode"] = detected_barcode
@@ -784,9 +820,6 @@ async def process_single_photo(update: Update, context: ContextTypes.DEFAULT_TYP
         if name == "-" and detected_name:
             name = detected_name
 
-        front_url = photo_url
-        barcode_url = photo_url if detected_barcode else ""
-
         record = await db_insert_count(
             user_id=user.id if user else 0,
             crew_name=crew_name,
@@ -795,9 +828,9 @@ async def process_single_photo(update: Update, context: ContextTypes.DEFAULT_TYP
             item_name=name,
             qty=qty,
             photo_front=file_path,
-            photo_barcode=file_path if detected_barcode else None,
-            photo_front_url=front_url,
-            photo_barcode_url=barcode_url
+            photo_barcode=None,
+            photo_front_url=photo_url,
+            photo_barcode_url=""
         )
         sync_manager.enqueue(record)
         qty_display = int(qty) if qty.is_integer() else qty
@@ -817,25 +850,16 @@ async def process_single_photo(update: Update, context: ContextTypes.DEFAULT_TYP
         context.user_data.clear()
         return ConversationHandler.END
 
-    name_status = f"\n📦 *Item:* `{detected_name}` (Auto-detected ✨)" if detected_name else ""
+    name_status = f"\n📦 *Item:* `{detected_name}` (Auto-detected ✨)" if detected_name and detected_name != "-" else ""
     barcode_status = f"\n🏷️ *Barcode:* `{detected_barcode}`" if detected_barcode else ""
-
-    if detected_barcode:
-        await safe_reply(
-            update,
-            f"📸 *Photo Received!*{name_status}{barcode_status}\n\n"
-            f"📍 *Please send Shelf & Quantity* (e.g. `R105 2` or `G101 12`):\n"
-            f"_(Or send Photo 2 for another angle)_"
-        )
-        return STATE_SHELF
 
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("⏩ Skip (No Barcode / Raw Material)", callback_data="skip_barcode_photo")]
     ])
     await safe_reply(
         update,
-        f"📸 *Photo 1 Received!*{name_status}\n\n"
-        f"📷 Send **Photo 2 (Barcode label)**\n_(Or type Shelf & Qty / tap Skip if Done):_",
+        f"📸 *Photo 1 Received!*{name_status}{barcode_status}\n\n"
+        f"📷 Send **Photo 2** (Or type Shelf e.g. `G101`):",
         reply_markup=kb
     )
     return STATE_BARCODE_PHOTO
@@ -843,30 +867,43 @@ async def process_single_photo(update: Update, context: ContextTypes.DEFAULT_TYP
 
 async def flow_receive_barcode_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     file_id = get_photo_file_id(update)
-    if file_id:
-        file_path, photo_url = await save_tg_photo(file_id, context, prefix="p2")
-        context.user_data["photo_barcode_path"] = file_path
-        context.user_data["photo_barcode_url"] = photo_url
+    if not file_id:
+        return await prompt_shelf_step(update, context)
 
-        detected_barcode, detected_name = await asyncio.gather(
-            asyncio.to_thread(detect_barcode_from_image, file_path),
-            extract_product_name_from_image(file_path) if not context.user_data.get("item_name") else asyncio.sleep(0)
-        )
+    p2_path, p2_url = await save_tg_photo(file_id, context, prefix="p2")
+    p1_path = context.user_data.get("photo1_path") or p2_path
+    p1_url = context.user_data.get("photo1_url") or p2_url
 
-        if detected_barcode:
-            context.user_data["detected_barcode"] = detected_barcode
-            context.user_data["barcode"] = detected_barcode
+    p2_barcode, p2_name = await asyncio.gather(
+        asyncio.to_thread(detect_barcode_from_image, p2_path),
+        extract_product_name_from_image(p2_path) if not context.user_data.get("item_name") else asyncio.sleep(0)
+    )
 
-        if detected_name and isinstance(detected_name, str) and not context.user_data.get("item_name"):
-            context.user_data["item_name"] = detected_name
+    p1_barcode = context.user_data.get("photo1_barcode")
+    p1_name = context.user_data.get("photo1_name") or context.user_data.get("item_name")
+
+    final_barcode = p2_barcode or p1_barcode or context.user_data.get("detected_barcode")
+    final_name = (p2_name if isinstance(p2_name, str) and p2_name != "-" else None) or p1_name or context.user_data.get("item_name")
+
+    if final_barcode:
+        context.user_data["detected_barcode"] = final_barcode
+        context.user_data["barcode"] = final_barcode
+
+    if final_name:
+        context.user_data["item_name"] = final_name
+
+    assign_photos_front_and_barcode(
+        context, p1_path, p1_url, p2_path, p2_url,
+        bool(p1_barcode), bool(p2_barcode), bool(p1_name), bool(p2_name and isinstance(p2_name, str))
+    )
 
     name_status = f"\n📦 *Item:* `{context.user_data.get('item_name')}`" if context.user_data.get("item_name") and context.user_data.get("item_name") != "-" else ""
     barcode_status = f"\n🏷️ *Barcode:* `{context.user_data.get('detected_barcode')}`" if context.user_data.get("detected_barcode") else ""
 
     await safe_reply(
         update,
-        f"📸 *Photo 2 Received!*{name_status}{barcode_status}\n\n"
-        f"📍 *Please send Shelf & Quantity* (e.g. `R105 2` or `G101 12`):"
+        f"📸 *2 Photos Received! (Front & Barcode)*{name_status}{barcode_status}\n\n"
+        f"📍 *Please type Shelf Code* (e.g. `G101` or `R105`):"
     )
     return STATE_SHELF
 
@@ -880,7 +917,7 @@ async def flow_skip_barcode_photo_cb(update: Update, context: ContextTypes.DEFAU
 async def prompt_shelf_step(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     await safe_reply(
         update,
-        "📍 *Please send Shelf & Quantity* (e.g. `R105 2` or `G101 12`):"
+        "📍 *Please type Shelf Code* (e.g. `G101` or `R105`):"
     )
     return STATE_SHELF
 
@@ -888,7 +925,7 @@ async def prompt_shelf_step(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 async def flow_shelf_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     raw_text = update.message.text.strip() if update.message and update.message.text else ""
     if not raw_text:
-        await safe_reply(update, "⚠️ Please type the Shelf Code (e.g. `R105` or `R105 2`):")
+        await safe_reply(update, "⚠️ Please type the Shelf Code (e.g. `G101` or `G101 1`):")
         return STATE_SHELF
 
     shelf, quick_qty = parse_shelf_qty_text(raw_text)
@@ -897,16 +934,22 @@ async def flow_shelf_text(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if quick_qty is not None:
         context.user_data["qty"] = quick_qty
         detected_barcode = context.user_data.get("detected_barcode") or context.user_data.get("barcode")
-        item_name = context.user_data.get("item_name")
 
         if detected_barcode and detected_barcode != "NO_BARCODE":
             context.user_data["barcode"] = detected_barcode
-            if item_name and item_name != "-":
-                return await finalize_and_save_count(update, context)
-            else:
-                return await check_item_name_step(update, context)
+            return await finalize_and_save_count(update, context)
         else:
             return await check_barcode_step(update, context)
+
+    # Only shelf was typed (e.g. "G101")
+    detected_barcode = context.user_data.get("detected_barcode") or context.user_data.get("barcode")
+    if detected_barcode and detected_barcode != "NO_BARCODE":
+        context.user_data["barcode"] = detected_barcode
+        await safe_reply(
+            update,
+            f"🔢 *Please type Quantity (QTY)* (e.g. `1`, `5`, `12`):"
+        )
+        return STATE_QTY
 
     return await check_barcode_step(update, context)
 
@@ -916,7 +959,13 @@ async def check_barcode_step(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     if detected_barcode:
         context.user_data["barcode"] = detected_barcode
-        return await check_item_name_step(update, context)
+        if not context.user_data.get("qty"):
+            await safe_reply(
+                update,
+                f"🔢 *Please type Quantity (QTY)* (e.g. `1`, `5`, `12`):"
+            )
+            return STATE_QTY
+        return await finalize_and_save_count(update, context)
 
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("⏩ Skip Barcode (Raw Material / No Code)", callback_data="skip_barcode_num")]
@@ -934,26 +983,33 @@ async def flow_barcode_callback(update: Update, context: ContextTypes.DEFAULT_TY
     await query.answer()
     if query.data == "skip_barcode_num":
         context.user_data["barcode"] = "NO_BARCODE"
-        return await check_item_name_step(update, context)
+        if not context.user_data.get("qty"):
+            await safe_reply(update, "🔢 *Please type Quantity (QTY)* (e.g. `1`, `5`, `12`):")
+            return STATE_QTY
+        return await finalize_and_save_count(update, context)
     return STATE_BARCODE
 
 
 async def flow_barcode_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     barcode = update.message.text.strip()
     context.user_data["barcode"] = barcode or "NO_BARCODE"
-    return await check_item_name_step(update, context)
+    if not context.user_data.get("qty"):
+        await safe_reply(update, "🔢 *Please type Quantity (QTY)* (e.g. `1`, `5`, `12`):")
+        return STATE_QTY
+    return await finalize_and_save_count(update, context)
 
 
 async def check_item_name_step(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     current_name = context.user_data.get("item_name")
 
     if current_name and current_name != "-" and len(current_name.strip()) > 1:
-        await safe_reply(
-            update,
-            f"📦 *Item:* `{current_name}` (Auto-detected ✨)\n\n"
-            f"🔢 *Please type the Quantity (QTY):*\n_(e.g. 1, 5, 12, 24)_"
-        )
-        return STATE_QTY
+        if not context.user_data.get("qty"):
+            await safe_reply(
+                update,
+                f"🔢 *Please type Quantity (QTY)* (e.g. `1`, `5`, `12`):"
+            )
+            return STATE_QTY
+        return await finalize_and_save_count(update, context)
 
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("⏩ Skip Name", callback_data="skip_item_name")]
@@ -971,20 +1027,32 @@ async def flow_item_name_callback(update: Update, context: ContextTypes.DEFAULT_
     await query.answer()
     if query.data == "skip_item_name":
         context.user_data["item_name"] = "-"
-        await safe_reply(update, "🔢 *Please type the Quantity (QTY):*\n_(e.g. 1, 5, 12, 24)_")
-        return STATE_QTY
+        if not context.user_data.get("qty"):
+            await safe_reply(update, "🔢 *Please type Quantity (QTY)* (e.g. `1`, `5`, `12`):")
+            return STATE_QTY
+        return await finalize_and_save_count(update, context)
     return STATE_ITEM_NAME
 
 
 async def flow_item_name_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     name = update.message.text.strip()
     context.user_data["item_name"] = name or "-"
-    await safe_reply(update, "🔢 *Please type the Quantity (QTY):*\n_(e.g. 1, 5, 12, 24)_")
-    return STATE_QTY
+    if not context.user_data.get("qty"):
+        await safe_reply(update, "🔢 *Please type Quantity (QTY)* (e.g. `1`, `5`, `12`):")
+        return STATE_QTY
+    return await finalize_and_save_count(update, context)
 
 
 async def flow_qty_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     text = update.message.text.strip() if update.message and update.message.text else ""
+    # Check if user typed combined "G101 1" at qty prompt
+    shelf, parsed_qty = parse_shelf_qty_text(text)
+    if parsed_qty is not None:
+        context.user_data["qty"] = parsed_qty
+        if shelf:
+            context.user_data["shelf"] = shelf
+        return await finalize_and_save_count(update, context)
+
     try:
         qty = float(text)
         if qty <= 0:
@@ -993,7 +1061,7 @@ async def flow_qty_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         context.user_data["qty"] = qty
         return await finalize_and_save_count(update, context)
     except ValueError:
-        await safe_reply(update, "⚠️ Please enter a valid number (e.g. `12` or `5`):")
+        await safe_reply(update, "⚠️ Please enter a valid number (e.g. `1` or `5`):")
         return STATE_QTY
 
 
@@ -1109,7 +1177,7 @@ async def main_async():
                 CommandHandler("cancel", flow_cancel)
             ],
             STATE_SHELF: [
-                MessageHandler(photo_filter, handle_incoming_photo),
+                MessageHandler(photo_filter, flow_receive_barcode_photo),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, flow_shelf_text),
                 CommandHandler("cancel", flow_cancel)
             ],
