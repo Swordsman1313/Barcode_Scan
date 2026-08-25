@@ -654,11 +654,22 @@ def assign_photos_front_and_barcode(
         context.user_data["photo_barcode_url"] = p2_url
 
 
+USER_PHOTO_LOCKS: Dict[int, asyncio.Lock] = {}
+
+
+def get_user_photo_lock(user_id: int) -> asyncio.Lock:
+    if user_id not in USER_PHOTO_LOCKS:
+        USER_PHOTO_LOCKS[user_id] = asyncio.Lock()
+    return USER_PHOTO_LOCKS[user_id]
+
+
 async def handle_incoming_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     message = update.message
     if not message:
         return ConversationHandler.END
 
+    user = update.effective_user
+    user_id = user.id if user else 0
     media_group_id = message.media_group_id
 
     if media_group_id:
@@ -681,10 +692,12 @@ async def handle_incoming_photo(update: Update, context: ContextTypes.DEFAULT_TY
         else:
             return await process_single_photo(album_updates[0], context)
     else:
-        # Check if user is sending a 2nd photo in existing session
-        if context.user_data.get("photo1_path") and not context.user_data.get("photo_barcode_path"):
-            return await flow_receive_barcode_photo(update, context)
-        return await process_single_photo(update, context)
+        # Serialize per user to prevent rapid Photo 2 from racing Photo 1
+        user_lock = get_user_photo_lock(user_id)
+        async with user_lock:
+            if context.user_data.get("photo1_path") and not context.user_data.get("photo_barcode_path"):
+                return await flow_receive_barcode_photo(update, context)
+            return await process_single_photo(update, context)
 
 
 async def process_album_photos(album_updates: List[Update], context: ContextTypes.DEFAULT_TYPE) -> int:
