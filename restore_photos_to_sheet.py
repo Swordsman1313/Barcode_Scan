@@ -32,11 +32,13 @@ def main():
         sys.exit(1)
 
     # 1. Ask for or read Webhook URL
+    default_url = "https://script.google.com/macros/s/AKfycby9E4U-6LRMUBiiqGULqoCJSczXmRaKb-xZy6kpVl3Vq-wlFc44gVZEaNq2ErV1lQcA/exec"
     webhook_url = os.getenv("GOOGLE_SHEET_WEBHOOK_URL", "").strip()
     if not webhook_url:
-        print("\nPlease enter your Google Apps Script Webhook URL:")
-        print("(From Google Sheets -> Extensions -> Apps Script -> Deploy -> Manage deployments -> Web app URL)")
-        webhook_url = input("Webhook URL: ").strip()
+        print(f"\nPress [Enter] to use detected Webhook URL, or paste a new one:")
+        print(f"Default: {default_url}")
+        user_input = input("Webhook URL: ").strip()
+        webhook_url = user_input if user_input else default_url
 
     if not webhook_url.startswith("http"):
         print("❌ Error: Invalid Webhook URL.")
@@ -106,6 +108,7 @@ def main():
         ts = rec["timestamp"]
         item = rec["item"]
         crew = rec["crew"]
+        bc = rec["barcode"]
 
         # 1. Restore Front Photo
         if rec["front_photo"]:
@@ -117,6 +120,8 @@ def main():
                     payload = {
                         "action": "restore_photo",
                         "timestamp": ts,
+                        "item": item,
+                        "barcode": bc,
                         "photo_base64": b64,
                         "is_barcode": False
                     }
@@ -139,6 +144,8 @@ def main():
                     payload = {
                         "action": "restore_photo",
                         "timestamp": ts,
+                        "item": item,
+                        "barcode": bc,
                         "photo_base64": b64,
                         "is_barcode": True
                     }

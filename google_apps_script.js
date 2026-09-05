@@ -1,3 +1,16 @@
+/**
+ * ONE-CLICK PERMISSION SETUP:
+ * Select "authorizeDrive" from the function dropdown at the top and click "Run" (▶️) ONCE.
+ * Click "Review permissions" -> Choose account -> Advanced -> Go to Untitled project (unsafe) -> Allow.
+ */
+function authorizeDrive() {
+  var folderName = "Stock_Count_Photos";
+  var folders = DriveApp.getFoldersByName(folderName);
+  var folder = folders.hasNext() ? folders.next() : DriveApp.createFolder(folderName);
+  folder.setSharing(DriveApp.Access.ANYONE_WITH_LINK, DriveApp.Permission.VIEW);
+  Logger.log("✅ Google Drive permission granted successfully!");
+}
+
 function doPost(e) {
   try {
     var sheet = SpreadsheetApp.getActiveSpreadsheet().getActiveSheet();
@@ -22,6 +35,8 @@ function doPost(e) {
       var targetTimestamp = data.timestamp || "";
       var photoBase64 = data.photo_base64;
       var isBarcode = !!data.is_barcode;
+      var targetItem = String(data.item || "").trim().toLowerCase();
+      var targetBarcode = String(data.barcode || "").trim();
       
       if (!photoBase64) {
         return ContentService.createTextOutput("Error: No photo_base64 provided");
@@ -33,6 +48,7 @@ function doPost(e) {
       if (data.row && Number(data.row) > 1) {
         foundRow = Number(data.row);
       } else if (targetTimestamp) {
+        // Pass 1: Exact timestamp match
         for (var r = 1; r < rows.length; r++) {
           var cellVal = rows[r][0];
           var formatted = (cellVal instanceof Date) 
@@ -41,6 +57,25 @@ function doPost(e) {
           if (formatted.indexOf(targetTimestamp) !== -1 || targetTimestamp.indexOf(formatted) !== -1) {
             foundRow = r + 1; // 1-indexed in Sheets
             break;
+          }
+        }
+        // Pass 2: Resilient match by Minute + (Item Name or Barcode)
+        if (foundRow === -1 && targetTimestamp.length >= 16) {
+          var minPrefix = targetTimestamp.substring(0, 16);
+          for (var r = 1; r < rows.length; r++) {
+            var cellVal = rows[r][0];
+            var formatted = (cellVal instanceof Date) 
+              ? Utilities.formatDate(cellVal, "Asia/Bangkok", "yyyy-MM-dd HH:mm:ss")
+              : String(cellVal).trim();
+            var rowBarcode = String(rows[r][3]).trim();
+            var rowItem = String(rows[r][4]).trim().toLowerCase();
+            if (formatted.indexOf(minPrefix) !== -1) {
+              if ((targetBarcode && targetBarcode !== "NO_BARCODE" && rowBarcode.indexOf(targetBarcode) !== -1) ||
+                  (targetItem && targetItem !== "-" && rowItem.indexOf(targetItem) !== -1)) {
+                foundRow = r + 1;
+                break;
+              }
+            }
           }
         }
       }
