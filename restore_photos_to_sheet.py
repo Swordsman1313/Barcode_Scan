@@ -98,13 +98,50 @@ def main():
                 })
 
     print(f"🎯 Successfully matched {len(records)} transactions with photos!")
-    print("\n⏳ Starting restoration into Google Sheet & Drive...")
+
+    # 3. Range Filtering (e.g. lines 194 to 219)
+    start_idx = 1
+    end_idx = len(records)
+
+    # Check command-line arguments (e.g. python3 restore_photos_to_sheet.py 194 219)
+    args = [a for a in sys.argv[1:] if not a.startswith("http")]
+    if len(args) == 2 and args[0].isdigit() and args[1].isdigit():
+        start_idx = int(args[0])
+        end_idx = int(args[1])
+    elif len(args) == 1 and "-" in args[0]:
+        parts = args[0].split("-")
+        if parts[0].isdigit() and parts[1].isdigit():
+            start_idx = int(parts[0])
+            end_idx = int(parts[1])
+    else:
+        print(f"\nSelect range of transactions to restore (Total: 1 to {len(records)}):")
+        print("Tip: To restore only lines 194 to 219, type: 194-219")
+        range_input = input("Enter range [Default: 194-219]: ").strip()
+        if not range_input or range_input.lower() in ["default", "d"]:
+            start_idx = 194
+            end_idx = min(219, len(records))
+        elif "-" in range_input:
+            parts = range_input.split("-")
+            if parts[0].strip().isdigit() and parts[1].strip().isdigit():
+                start_idx = int(parts[0].strip())
+                end_idx = int(parts[1].strip())
+        elif range_input.isdigit():
+            start_idx = int(range_input)
+            end_idx = int(range_input)
+
+    # Filter records
+    filtered_records = [
+        (i, rec) for i, rec in enumerate(records, 1)
+        if start_idx <= i <= end_idx
+    ]
+
+    print(f"\n🚀 Restoring {len(filtered_records)} transactions (Lines {start_idx} to {end_idx})...")
     print("-" * 65)
 
     success = 0
     skipped = 0
 
-    for i, rec in enumerate(records, 1):
+    for i, rec in filtered_records:
         ts = rec["timestamp"]
         item = rec["item"]
         crew = rec["crew"]
