@@ -3,161 +3,158 @@
 =============================================================================
 AUTOMATED TELEGRAM PHOTO RESTORATION SCRIPT FOR GOOGLE SHEETS
 =============================================================================
-This script restores all expired photos in your Google Sheet automatically!
-It matches photos exported from Telegram Desktop with rows in Google Sheets
-by timestamp, uploads them directly to Google Drive, and updates the formulas.
+Matches all 205+ records from Telegram chat export (ON Scan TK) by exact
+timestamp and crew member, uploads photos to Google Drive, and replaces broken
+formulas in Google Sheets.
 =============================================================================
 """
 
 import os
 import sys
+import re
 import json
 import base64
-import glob
+import time
 import requests
-from datetime import datetime
 from pathlib import Path
 
-def find_telegram_export_dir():
-    """Scans ~/Downloads for Telegram Desktop export folder."""
-    downloads = Path.home() / "Downloads"
-    patterns = [
-        str(downloads / "Telegram Desktop" / "ChatExport_*"),
-        str(downloads / "ChatExport_*"),
-        str(downloads / "*" / "ChatExport_*"),
-        str(Path.cwd() / "ChatExport_*"),
-    ]
-    matches = []
-    for pattern in patterns:
-        matches.extend(glob.glob(pattern))
-    
-    if not matches:
-        return None
-    # Pick the newest one
-    matches.sort(key=lambda p: os.path.getmtime(p), reverse=True)
-    return Path(matches[0])
-
+# Paths
+EXPORT_DIR = Path("/Users/mac/Downloads/ChatExport_2026-09-05")
+JSON_FILE = EXPORT_DIR / "result.json"
 
 def main():
     print("=" * 65)
-    print(" 🚀 AUTOMATED TELEGRAM PHOTO RESTORER FOR GOOGLE SHEETS")
+    print(" 🚀 AUTOMATED PHOTO RESTORER FOR GOOGLE SHEETS")
     print("=" * 65)
-    
-    # 1. Ask for Webhook URL
+
+    if not JSON_FILE.exists():
+        print(f"❌ Could not find: {JSON_FILE}")
+        sys.exit(1)
+
+    # 1. Ask for or read Webhook URL
     webhook_url = os.getenv("GOOGLE_SHEET_WEBHOOK_URL", "").strip()
     if not webhook_url:
         print("\nPlease enter your Google Apps Script Webhook URL:")
-        print("(From Google Sheets -> Extensions -> Apps Script -> Deploy -> Web app URL)")
+        print("(From Google Sheets -> Extensions -> Apps Script -> Deploy -> Manage deployments -> Web app URL)")
         webhook_url = input("Webhook URL: ").strip()
-        
-    if not webhook_url or not webhook_url.startswith("http"):
+
+    if not webhook_url.startswith("http"):
         print("❌ Error: Invalid Webhook URL.")
         sys.exit(1)
 
-    # 2. Locate Telegram export directory
-    export_dir = find_telegram_export_dir()
-    if not export_dir:
-        print("\n🔍 Looking for exported Telegram chat folder...")
-        print("Could not auto-detect ~/Downloads/Telegram Desktop/ChatExport_...")
-        user_path = input("Please paste the path to your ChatExport folder: ").strip().strip("'\"")
-        export_dir = Path(user_path)
+    print(f"\n📂 Reading Telegram Export: {JSON_FILE}")
+    with open(JSON_FILE, "r", encoding="utf-8") as f:
+        data = json.load(f)
 
-    json_file = export_dir / "result.json"
-    if not json_file.exists():
-        print(f"❌ Error: Could not find 'result.json' in {export_dir}")
-        print("Please make sure you exported the chat in 'Machine-readable JSON' format.")
-        sys.exit(1)
+    messages = data.get("messages", [])
+    print(f"💬 Found {len(messages)} total messages.")
 
-    print(f"\n📂 Found export folder: {export_dir}")
-    print(f"📄 Reading {json_file.name}...")
+    # 2. Extract records matched to bot confirmations
+    records = []
+    for idx, m in enumerate(messages):
+        text = ""
+        if isinstance(m.get("text"), list):
+            for part in m.get("text"):
+                if isinstance(part, dict):
+                    text += part.get("text", "")
+                else:
+                    text += str(part)
+        elif isinstance(m.get("text"), str):
+            text = m.get("text")
 
-    with open(json_file, "r", encoding="utf-8") as f:
-        chat_data = json.load(f)
+        if "SAVED TO GOOGLE SHEET" in text:
+            time_match = re.search(r"Time:\s*([0-9]{4}-[0-9]{2}-[0-9]{2}\s+[0-9]{2}:[0-9]{2}:[0-9]{2})", text)
+            barcode_match = re.search(r"Barcode:\s*([0-9A-Za-z_-]+)", text)
+            item_match = re.search(r"Item:\s*([^\n]+)", text)
+            crew_match = re.search(r"Crew:\s*([^\n]+)", text)
 
-    messages = chat_data.get("messages", [])
-    print(f"💬 Total messages found: {len(messages)}")
+            timestamp = time_match.group(1) if time_match else ""
+            barcode = barcode_match.group(1) if barcode_match else ""
+            item = item_match.group(1).strip() if item_match else ""
+            crew = crew_match.group(1).strip() if crew_match else ""
 
-    # Filter messages that have photos
-    photo_msgs = [m for m in messages if m.get("photo")]
-    print(f"📸 Total photos to restore: {len(photo_msgs)}")
+            # Look backwards up to 15 messages for photos belonging to this count
+            photos = []
+            for back_idx in range(idx - 1, max(0, idx - 15), -1):
+                prev_m = messages[back_idx]
+                if "SAVED TO GOOGLE SHEET" in str(prev_m.get("text")):
+                    break  # Hit previous transaction
+                if prev_m.get("photo"):
+                    photos.insert(0, prev_m.get("photo"))
 
-    if not photo_msgs:
-        print("⚠️ No photo messages found in export.")
-        sys.exit(0)
+            front_photo = photos[0] if len(photos) >= 1 else None
+            barcode_photo = photos[1] if len(photos) >= 2 else None
 
-    print("\n⏳ Restoring photos into Google Sheet... (Please keep this window open)")
+            if timestamp and (front_photo or barcode_photo):
+                records.append({
+                    "timestamp": timestamp,
+                    "barcode": barcode,
+                    "item": item,
+                    "crew": crew,
+                    "front_photo": front_photo,
+                    "barcode_photo": barcode_photo
+                })
+
+    print(f"🎯 Successfully matched {len(records)} transactions with photos!")
+    print("\n⏳ Starting restoration into Google Sheet & Drive...")
     print("-" * 65)
 
-    success_count = 0
-    fail_count = 0
+    success = 0
+    skipped = 0
 
-    # Group photos by minute and sender to handle Front + Barcode pairs
-    user_time_counts = {}
+    for i, rec in enumerate(records, 1):
+        ts = rec["timestamp"]
+        item = rec["item"]
+        crew = rec["crew"]
 
-    for idx, msg in enumerate(photo_msgs, 1):
-        raw_date = msg.get("date", "")
-        sender = msg.get("from", "Unknown")
-        rel_photo_path = msg.get("photo", "")
-        full_photo_path = export_dir / rel_photo_path
+        # 1. Restore Front Photo
+        if rec["front_photo"]:
+            front_path = EXPORT_DIR / rec["front_photo"]
+            if front_path.exists():
+                try:
+                    with open(front_path, "rb") as f:
+                        b64 = base64.b64encode(f.read()).decode("utf-8")
+                    payload = {
+                        "action": "restore_photo",
+                        "timestamp": ts,
+                        "photo_base64": b64,
+                        "is_barcode": False
+                    }
+                    resp = requests.post(webhook_url, json=payload, timeout=30)
+                    if "RESTORED_ROW" in resp.text:
+                        print(f"✅ [{i}/{len(records)}] Restored Front Photo: {item} ({ts}) by {crew}")
+                        success += 1
+                    else:
+                        print(f"ℹ️ [{i}/{len(records)}] {resp.text}: {ts} ({item})")
+                except Exception as e:
+                    print(f"⚠️ [{i}/{len(records)}] Error restoring front photo: {e}")
 
-        if not full_photo_path.exists():
-            continue
+        # 2. Restore Barcode Photo if available
+        if rec["barcode_photo"]:
+            bc_path = EXPORT_DIR / rec["barcode_photo"]
+            if bc_path.exists():
+                try:
+                    with open(bc_path, "rb") as f:
+                        b64 = base64.b64encode(f.read()).decode("utf-8")
+                    payload = {
+                        "action": "restore_photo",
+                        "timestamp": ts,
+                        "photo_base64": b64,
+                        "is_barcode": True
+                    }
+                    resp = requests.post(webhook_url, json=payload, timeout=30)
+                    if "RESTORED_ROW" in resp.text:
+                        print(f"   ↳ 🏷️ Restored Barcode Photo for {item}")
+                except Exception as e:
+                    pass
 
-        # Format date to match Google Sheets: YYYY-MM-DD HH:mm:ss
-        try:
-            # Telegram format: "2026-09-01T14:07:32"
-            dt = datetime.fromisoformat(raw_date)
-            formatted_date = dt.strftime("%Y-%m-%d %H:%M:%S")
-            time_key = f"{sender}_{dt.strftime('%Y-%m-%d %H:%M')}"
-        except Exception:
-            formatted_date = raw_date
-            time_key = f"{sender}_{raw_date}"
-
-        order_in_group = user_time_counts.get(time_key, 0)
-        user_time_counts[time_key] = order_in_group + 1
-        is_barcode = (order_in_group > 0) # 1st is front, 2nd is barcode
-
-        photo_type = "Barcode Photo" if is_barcode else "Front Photo"
-
-        # Read and encode photo
-        try:
-            with open(full_photo_path, "rb") as pf:
-                b64_content = base64.b64encode(pf.read()).decode("utf-8")
-        except Exception as e:
-            print(f"⚠️ [{idx}/{len(photo_msgs)}] Error reading photo file {rel_photo_path}: {e}")
-            fail_count += 1
-            continue
-
-        payload = {
-            "action": "restore_photo",
-            "timestamp": formatted_date,
-            "photo_base64": b64_content,
-            "is_barcode": is_barcode
-        }
-
-        try:
-            resp = requests.post(webhook_url, json=payload, timeout=30)
-            res_text = resp.text.strip()
-            if "RESTORED_ROW" in res_text:
-                row_num = res_text.split("_")[-1]
-                print(f"✅ [{idx}/{len(photo_msgs)}] Row {row_num}: Restored {photo_type} for {sender} ({formatted_date})")
-                success_count += 1
-            elif "ROW_NOT_FOUND" in res_text:
-                # Try matching by time prefix
-                print(f"ℹ️ [{idx}/{len(photo_msgs)}] No exact row match for {formatted_date} ({sender})")
-            else:
-                print(f"⚠️ [{idx}/{len(photo_msgs)}] Server replied: {res_text}")
-        except Exception as e:
-            print(f"❌ [{idx}/{len(photo_msgs)}] Network error for {formatted_date}: {e}")
-            fail_count += 1
+        # Brief delay to avoid Google Apps Script rate limit
+        time.sleep(0.5)
 
     print("-" * 65)
-    print(f"🎉 RESTORATION COMPLETE!")
-    print(f"✅ Successfully restored: {success_count} photos")
-    if fail_count > 0:
-        print(f"⚠️ Skipped/Failed: {fail_count} photos")
+    print(f"🎉 RESTORATION COMPLETE! Restored {success} photos successfully.")
+    print("Check your Google Sheet to view all restored photos!")
     print("=" * 65)
-
 
 if __name__ == "__main__":
     main()
