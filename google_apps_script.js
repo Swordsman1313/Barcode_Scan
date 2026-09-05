@@ -25,9 +25,13 @@ function doPost(e) {
     var frontUrl = data.photo_front_url || data.photo_url || "";
     var barcodeUrl = data.photo_barcode_url || "";
     
-    // Clickable HD Image Formula: Click image to open Full HD original in new tab!
-    var frontFormula = frontUrl ? '=HYPERLINK("' + frontUrl + '", IMAGE("' + frontUrl + '", 1))' : "";
-    var barcodeFormula = barcodeUrl ? '=HYPERLINK("' + barcodeUrl + '", IMAGE("' + barcodeUrl + '", 1))' : "";
+    // Save photos permanently to Google Drive so they NEVER expire
+    var frontDrive = saveImageToDrive(frontUrl, "front_" + (data.barcode || "item") + "_" + new Date().getTime() + ".jpg");
+    var barcodeDrive = saveImageToDrive(barcodeUrl, "barcode_" + (data.barcode || "item") + "_" + new Date().getTime() + ".jpg");
+    
+    // Clickable HD Image Formula: Shows thumbnail in cell and opens HD image on click
+    var frontFormula = frontDrive.viewUrl ? '=HYPERLINK("' + frontDrive.viewUrl + '", IMAGE("' + frontDrive.thumbUrl + '", 1))' : "";
+    var barcodeFormula = barcodeDrive.viewUrl ? '=HYPERLINK("' + barcodeDrive.viewUrl + '", IMAGE("' + barcodeDrive.thumbUrl + '", 1))' : "";
     
     sheet.appendRow([timestamp, crew, shelf, barcode, itemName, qty, frontFormula, barcodeFormula]);
     
@@ -41,4 +45,35 @@ function doPost(e) {
   } catch (err) {
     return ContentService.createTextOutput("Error: " + err.toString());
   }
+}
+
+/**
+ * Downloads image from temporary URL and saves permanently in Google Drive folder "Stock_Count_Photos"
+ */
+function saveImageToDrive(url, filename) {
+  if (!url || !url.startsWith("http")) {
+    return { thumbUrl: "", viewUrl: "" };
+  }
+  try {
+    var response = UrlFetchApp.fetch(url, { muteHttpExceptions: true });
+    if (response.getResponseCode() === 200) {
+      var blob = response.getBlob().setName(filename);
+      var folderName = "Stock_Count_Photos";
+      var folders = DriveApp.getFoldersByName(folderName);
+      var folder = folders.hasNext() ? folders.next() : DriveApp.createFolder(folderName);
+      folder.setSharing(DriveApp.Access.ANYONE_WITH_LINK, DriveApp.Permission.VIEW);
+      
+      var file = folder.createFile(blob);
+      file.setSharing(DriveApp.Access.ANYONE_WITH_LINK, DriveApp.Permission.VIEW);
+      
+      var fileId = file.getId();
+      var thumbUrl = "https://drive.google.com/thumbnail?id=" + fileId + "&sz=w1000";
+      var viewUrl = "https://drive.google.com/uc?export=view&id=" + fileId;
+      return { thumbUrl: thumbUrl, viewUrl: viewUrl };
+    }
+  } catch (e) {
+    Logger.log("Drive save error: " + e);
+  }
+  // Fallback to original URL if Drive save fails
+  return { thumbUrl: url, viewUrl: url };
 }

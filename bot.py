@@ -583,7 +583,11 @@ async def save_tg_photo(file_id: str, context: ContextTypes.DEFAULT_TYPE, prefix
         await tg_file.download_to_drive(custom_path=file_path)
         
         raw_path = tg_file.file_path or ""
-        if raw_path.startswith("http"):
+        app_url = clean_env(os.getenv("RENDER_EXTERNAL_URL") or os.getenv("APP_URL") or "")
+        
+        if app_url:
+            photo_url = f"{app_url.rstrip('/')}/photos/{filename}"
+        elif raw_path.startswith("http"):
             photo_url = raw_path
         elif raw_path:
             token = clean_env(os.getenv("TELEGRAM_BOT_TOKEN") or TELEGRAM_BOT_TOKEN)
@@ -1046,6 +1050,7 @@ async def main_async():
     app_web = web.Application()
     app_web.router.add_get("/", handle_health_check)
     app_web.router.add_get("/health", handle_health_check)
+    app_web.router.add_static("/photos/", path=str(PHOTOS_DIR))
     runner = web.AppRunner(app_web)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", PORT)
