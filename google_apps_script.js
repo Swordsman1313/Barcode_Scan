@@ -16,6 +16,59 @@ function doPost(e) {
     }
     
     var data = JSON.parse(e.postData.contents);
+    
+    // --- BATCH PHOTO RESTORE HANDLER (Recovers past photos automatically) ---
+    if (data.action === "restore_photo") {
+      var targetTimestamp = data.timestamp || "";
+      var photoBase64 = data.photo_base64;
+      var isBarcode = !!data.is_barcode;
+      
+      if (!photoBase64) {
+        return ContentService.createTextOutput("Error: No photo_base64 provided");
+      }
+      
+      var rows = sheet.getDataRange().getValues();
+      var foundRow = -1;
+      
+      if (data.row && Number(data.row) > 1) {
+        foundRow = Number(data.row);
+      } else if (targetTimestamp) {
+        for (var r = 1; r < rows.length; r++) {
+          var cellVal = rows[r][0];
+          var formatted = (cellVal instanceof Date) 
+            ? Utilities.formatDate(cellVal, "Asia/Bangkok", "yyyy-MM-dd HH:mm:ss")
+            : String(cellVal).trim();
+          if (formatted.indexOf(targetTimestamp) !== -1 || targetTimestamp.indexOf(formatted) !== -1) {
+            foundRow = r + 1; // 1-indexed in Sheets
+            break;
+          }
+        }
+      }
+      
+      if (foundRow > 1 && foundRow <= sheet.getLastRow()) {
+        var folderName = "Stock_Count_Photos";
+        var folders = DriveApp.getFoldersByName(folderName);
+        var folder = folders.hasNext() ? folders.next() : DriveApp.createFolder(folderName);
+        folder.setSharing(DriveApp.Access.ANYONE_WITH_LINK, DriveApp.Permission.VIEW);
+        
+        var filename = "restored_" + (isBarcode ? "barcode_" : "front_") + foundRow + "_" + new Date().getTime() + ".jpg";
+        var blob = Utilities.newBlob(Utilities.base64Decode(photoBase64), "image/jpeg", filename);
+        var file = folder.createFile(blob);
+        file.setSharing(DriveApp.Access.ANYONE_WITH_LINK, DriveApp.Permission.VIEW);
+        
+        var fileId = file.getId();
+        var thumbUrl = "https://drive.google.com/thumbnail?id=" + fileId + "&sz=w1000";
+        var viewUrl = "https://drive.google.com/uc?export=view&id=" + fileId;
+        var formula = '=HYPERLINK("' + viewUrl + '", IMAGE("' + thumbUrl + '", 1))';
+        
+        var col = isBarcode ? 8 : 7;
+        sheet.getRange(foundRow, col).setValue(formula);
+        sheet.setRowHeight(foundRow, 85);
+        return ContentService.createTextOutput("RESTORED_ROW_" + foundRow);
+      }
+      return ContentService.createTextOutput("ROW_NOT_FOUND");
+    }
+    
     var timestamp = data.timestamp || Utilities.formatDate(new Date(), "Asia/Bangkok", "yyyy-MM-dd HH:mm:ss");
     var crew = data.crew || "Unknown";
     var shelf = String(data.shelf || "").toUpperCase();
